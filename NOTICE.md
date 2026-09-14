@@ -10,10 +10,6 @@ FungiCapture depends on and the attribution each one requires. It is
 informational; where it and a component's own license text differ, the license
 text governs.
 
-> This file is an engineer's summary of published license texts, not legal
-> advice. The binding review for release is your supervisor and TU Wien's
-> technology-transfer office.
-
 ---
 
 ## 1. Why FungiCapture is AGPL-3.0
@@ -28,8 +24,6 @@ AGPL-licensed code.
 ---
 
 ## 2. Core runtime dependencies
-
-All permissive; each requires only that its copyright notice be retained.
 
 | Package | License (SPDX) |
 |---|---|
@@ -60,11 +54,6 @@ All permissive; each requires only that its copyright notice be retained.
 |---|---|---|
 | PySide6 (Qt for Python) | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only (commercial option also exists) | **FungiCapture distributes PySide6 under the LGPL-3.0-only option.** |
 
-LGPL-3.0 requires that a user be able to replace the Qt libraries with their own
-build. FungiCapture's PyInstaller packaging is one-folder (Qt shipped as separate
-shared libraries) so this replacement is possible, and the LGPL-3.0 text is
-shipped with any binary distribution.
-
 ---
 
 ## 4. Optional extra: `[model]` — SAM 3
@@ -86,11 +75,6 @@ they request access and accept the license themselves. The full SAM License text
 is included at [`LICENSES/SAM_LICENSE.txt`](LICENSES/SAM_LICENSE.txt) for
 reference.
 
-If you publish research produced with the SAM 3 backend, the SAM License requires
-you to acknowledge it, for example:
-
-> Colony segmentation used the Segment Anything Model 3 (SAM 3), released by
-> Meta AI under the SAM License.
 
 Model source and gated download: <https://github.com/facebookresearch/sam3> ·
 <https://huggingface.co/facebook/sam3>
@@ -105,5 +89,4 @@ non-GPL application).
 
 ---
 
-*For the full dependency-by-dependency analysis, including SPDX expressions and
-bundled native libraries, see [`docs/DEPENDENCIES_AND_LICENSING.md`](docs/DEPENDENCIES_AND_LICENSING.md).*
+
