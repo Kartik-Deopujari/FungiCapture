@@ -2,8 +2,6 @@
   FungiCapture  —  how to start
 ===============================================================
 
-You do not need to know anything about programming.
-
 FIRST TIME on this computer? Run the SETUP file for your system
 once. It installs everything needed (including, on Linux, the
 system graphics libraries) and checks a window really opens:
