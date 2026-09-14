@@ -1,7 +1,6 @@
 # NOTICE — FungiCapture third-party attributions
 
 FungiCapture
-Copyright (C) 2026 Kartik Deopujari
 
 This program is licensed under the **GNU Affero General Public License, version 3
 or later (AGPL-3.0-or-later)**. The complete, legally binding license text is in
