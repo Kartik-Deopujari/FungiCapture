@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fungicapture"
+version = "0.1.0.dev0"
+description = "High-throughput image-based phenotyping of fungal colonies, from agar plate photograph to GWAS-ready scores."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Kartik Deopujari" }]
+keywords = ["mycology", "phenotyping", "image-analysis", "GWAS", "colony", "melanization"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# core/ dependencies only. The GUI and the model backend are extras, so the
+# science can be installed and run headless on a compute cluster.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "scikit-image>=0.22",
+    "scikit-learn>=1.3",
+    "matplotlib>=3.7",
+    "opencv-python-headless>=4.8",
+    "platformdirs>=3.0",
+    "tomli>=2.0; python_version<'3.11'",
+    "tomli-w>=1.0",
+    "Pillow>=10.0",
+    # Lets tifffile decompress LZW and JPEG-in-TIFF. Scanner and microscope
+    # software writes those constantly, and without this they fail to open.
+    "imagecodecs>=2023.1; python_version<\"3.14\"",
+    # Decodes camera RAW files (.nef, .cr2, .dng, ...) at full resolution.
+    # Without it the generic decoders silently return the tiny embedded
+    # preview thumbnail, so RAW plates crop to an unusable resolution.
+    "rawpy>=0.19",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+# NOTE: ultralytics is AGPL-3.0. It is the reason this project is AGPL-3.0.
+# See docs/LICENSING.md before changing this.
+# 8.3.237 is the release that added SAM 3; an older 8.3.x installs cleanly but
+# then fails to import SAM3SemanticPredictor, which looks like "segmentation is
+# broken". torchvision is required by ultralytics and must be installed too.
+#
+# WARNING: ultralytics depends on `opencv-python` (the DESKTOP build). Installed
+# next to our `opencv-python-headless` it shares the same `cv2` folder and its
+# bundled Qt plugins hijack PySide6's, crashing the GUI on start-up. The in-app
+# installer (core/setup_env.py::install_segmentation) removes it and
+# force-reinstalls headless. If you instead run `pip install .[gui,model]`
+# directly, do the same afterwards:
+#     pip uninstall -y opencv-python
+#     pip install --force-reinstall --no-deps opencv-python-headless
+model = ["ultralytics>=8.3.237", "torch>=2.1", "torchvision>=0.16"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "hypothesis>=6.90", "pip-licenses>=4.3"]
+all = ["fungicapture[gui,model,dev]"]
+
+[project.scripts]
+fungicapture = "fungicapture.cli.main:main"
+
+[project.gui-scripts]
+fungicapture-gui = "fungicapture.gui.app:main"
+
+[project.urls]
+Homepage = "https://github.com/kartikdeopujari/fungicapture"
+Issues = "https://github.com/kartikdeopujari/fungicapture/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fungicapture = ["resources/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: takes more than a few seconds",
+    "needs_model: requires SAM 3 weights to be present",
+    "needs_gui: requires PySide6 and a display",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"

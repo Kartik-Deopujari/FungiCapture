@@ -1,0 +1,211 @@
+===============================================================
+  FungiCapture  —  how to start
+===============================================================
+
+You do not need to know anything about programming.
+
+FIRST TIME on this computer? Run the SETUP file for your system
+once. It installs everything needed (including, on Linux, the
+system graphics libraries) and checks a window really opens:
+
+  Windows ....  double-click  SETUP FungiCapture (Windows).bat
+  Mac ........  double-click  SETUP FungiCapture (Mac).command
+  Linux ......  double-click  SETUP FungiCapture (Linux).sh
+
+EVERY TIME AFTER THAT, just open the program with the START file:
+
+  Windows ....  double-click  START FungiCapture (Windows).bat
+  Mac ........  double-click  START FungiCapture (Mac).command
+  Linux ......  double-click  START FungiCapture (Linux).sh
+
+(The START files also set themselves up on first run, so you can
+skip SETUP if you like - but on a fresh Linux machine SETUP is the
+smoothest path, because it also installs the system libraries that
+the graphical window needs.)
+
+The first run installs what is needed (a few minutes, needs
+internet). After that it opens in seconds.
+
+If it says Python is missing, see the section near the bottom
+of this file.
+
+
+---------------------------------------------------------------
+  IS THERE A VERSION THAT NEEDS NO INSTALL AT ALL?
+---------------------------------------------------------------
+
+Yes — a "standalone" version that carries everything inside it,
+so no Python and no downloading is needed.
+
+  LINUX     A standalone build is ready:
+            FungiCapture-0.1.0-linux-x86_64.tar.gz
+            Unpack it and double-click "Start FungiCapture.sh".
+
+  WINDOWS   A standalone .exe has to be built on a Windows
+            computer — the tool that makes .exe files cannot run
+            on Linux or Mac. Two ways to get one:
+
+            (a) On any Windows PC, double-click
+                BUILD WINDOWS EXE.bat  in this folder.
+                It produces dist\FungiCapture\FungiCapture.exe
+                Takes 10-20 minutes. You only do this once, and
+                you can then copy that folder to any other
+                Windows PC.
+
+            (b) Without a Windows PC at all: put this project on
+                GitHub, open the "Actions" tab, click
+                "Test and build" then "Run workflow". GitHub
+                builds it on a Windows machine for you and you
+                download the result. Details are in the comments
+                at the top of .github/workflows/build.yml
+
+  MAC       Same as Windows: build it on a Mac with
+            bash packaging/build.sh, or use the GitHub route.
+
+Until then, the double-click launchers above work perfectly
+well on all three systems.
+
+
+---------------------------------------------------------------
+  WINDOWS
+---------------------------------------------------------------
+
+  Double-click:     START FungiCapture (Windows).bat
+
+  If Windows shows a blue box saying "Windows protected your PC":
+  click "More info", then "Run anyway". This appears because the
+  file is not signed, not because anything is wrong.
+
+
+---------------------------------------------------------------
+  MAC
+---------------------------------------------------------------
+
+  Double-click:     START FungiCapture (Mac).command
+
+  The first time, macOS may refuse to open it. If that happens:
+  right-click the file, choose "Open", then click "Open" again.
+
+
+---------------------------------------------------------------
+  LINUX
+---------------------------------------------------------------
+
+  Double-click:     START FungiCapture (Linux).sh
+
+  If double-clicking does nothing, open a terminal in this folder
+  and type:     bash "START FungiCapture (Linux).sh"
+
+
+===============================================================
+  WHAT HAPPENS THE FIRST TIME
+===============================================================
+
+The first time you start it, the launcher sets everything up for
+you. This takes about 3 to 10 minutes depending on your internet
+speed, and it needs an internet connection.
+
+You will see a lot of text scrolling by. That is normal. Leave it
+alone until the FungiCapture window opens.
+
+Every time after that, it starts in a few seconds.
+
+
+===============================================================
+  IF IT SAYS "PYTHON IS NOT INSTALLED"
+===============================================================
+
+FungiCapture needs Python. It is free and safe.
+
+  1. Go to:   https://www.python.org/downloads/
+  2. Download Python 3.11 or newer.
+  3. IMPORTANT (Windows only): on the first screen of the
+     installer, tick the box that says
+     "Add Python to PATH"  before clicking Install.
+  4. Install it, then double-click the FungiCapture launcher again.
+
+On most Linux systems Python is already installed. If not:
+  Ubuntu / Debian:  sudo apt install python3 python3-venv python3-pip
+  Fedora:           sudo dnf install python3 python3-pip
+
+
+===============================================================
+  BETTER SEGMENTATION (optional)
+===============================================================
+
+FungiCapture works straight away using a built-in segmenter.
+It is fine for compact colonies but weaker on faint, fuzzy
+filamentous edges.
+
+For the much better SAM 3 model:
+
+  Open the "2 Segment" tab and press "Segmentation setup...".
+
+That window tells you what graphics hardware you have, what is
+installed, and what will actually run. Press "Install
+segmentation model" and it downloads the version that matches
+your graphics driver. About 2 GB.
+
+The Segment tab always shows, in one line, which segmenter is
+really being used - so it can never quietly fall back without
+telling you.
+
+
+===============================================================
+  YOU DO NOT HAVE TO START AT THE BEGINNING
+===============================================================
+
+Every tab has its own input and output folders at the top.
+
+If you already have colony crops from an earlier run, or from
+another program, open the "2 Segment" tab, point "Colony
+images" at that folder, and start there. Nothing forces you to
+run the whole pipeline.
+
+The same is true of every tab: point "Feature table" at an old
+all_colony_features.csv to re-score it without measuring again.
+
+
+===============================================================
+  ONCE THE WINDOW OPENS
+===============================================================
+
+FungiCapture asks you one question first:
+"What does one photograph contain?"
+
+  One plate, one colony ................ Single dish
+  A folder of plates, one colony each .. Dish batch
+  One big plate with many colonies ..... Gridded plate
+  Many big plates, same layout ......... Plate batch   <- usual
+
+Then work left to right through the five tabs:
+
+  1 Plates      cut your photos into one image per colony
+  2 Segment     find the outline of each colony
+  3 Features    measure shape, texture and colour
+  4 Validate    look at the results, mark good or bad
+  5 Phenotypes  produce the GWAS table
+
+There is a full walkthrough in:   docs/USER_GUIDE.md
+
+
+===============================================================
+  WANT TO TRY IT WITHOUT YOUR OWN PHOTOS?
+===============================================================
+
+The folder examples/sample_dataset contains 3 practice plates.
+When the app asks for your images folder, point it at:
+
+     examples/sample_dataset/plates
+
+and set the plate size to 4 rows and 6 columns.
+
+
+===============================================================
+  SOMETHING WENT WRONG?
+===============================================================
+
+The launcher writes what happened to:   setup_log.txt
+Send that file to whoever gave you FungiCapture.
+
+===============================================================
