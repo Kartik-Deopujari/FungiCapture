@@ -1,0 +1,34 @@
+## AI Assistance Disclosure
+
+FungiCapture was built with use of AI coding assistants (large
+language models. AI tools helped write a large part of the source code, the tests, and this
+documentation.
+
+**Human oversight.** The authors directed the design, guided
+the AI, and reviewed the output. The authors take responsibility for the project
+as a whole. However, this review is **ongoing** — not every line of
+code or every sentence of the docs has been fully checked or tested yet.
+
+**Please validate before use.** This is a research tool. The
+results it produces are **not guaranteed to be correct**. Before you use
+any output in your own analysis, thesis, or publication, please test the
+tool against data you already understand (a known ground truth) and
+confirm the numbers make sense for your case. Treat FungiCapture as a
+helper, not as a source of final, verified truth.
+
+**Extra care for measured values used in statistics.** FungiCapture
+produces statistics that you may feed into a downstream analysis such as a GWAS. A small, silent
+error in these numbers can create a false gene–trait association or hide
+a real one, and this kind of mistake is hard to notice later. Before you
+use these values, manually check a random sample of them against the
+original images and confirm they match. Do this again whenever you
+change your input images, settings, or the tool version.
+
+**No warranty.** This software is provided "as is", without warranty of
+any kind. You use it at your own risk. See the LICENSE file for the full
+terms.
+
+**Help improve it.** We are actively testing and fixing the tool. If you
+find a bug, a wrong result, or unclear documentation, please open an
+issue on this repository — that feedback directly makes it safer for
+everyone.
