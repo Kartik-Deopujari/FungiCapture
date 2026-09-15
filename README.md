@@ -94,5 +94,5 @@ fungicapture gui [PROJECT]
 
 ---
 
-
-
+##GWAS phenotypes using PCA is based on 
+Zhang, W., Gao, X., Shi, X., Zhu, B., Wang, Z., Gao, H., Xu, L., Zhang, L., Li, J., & Chen, Y. (2018). PCA-Based Multiple-Trait GWAS Analysis: A Powerful Model for Exploring Pleiotropy. Animals, 8(12), 239. https://doi.org/10.3390/ani8120239
