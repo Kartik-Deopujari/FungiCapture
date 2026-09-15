@@ -19,7 +19,7 @@ plate photograph
  2 Segment     find the colony outline with SAM 3, using text prompts for both
       │        the dense core and the faint filamentous margin
       ▼
- 3 Features    ~400 numbers per colony: shape, brightness, GLCM + LBP texture,
+ 3 Features    ~504 numbers per colony: shape, brightness, GLCM + LBP texture,
       │        and colour including melanization — interior and boundary ring
       ▼
  4 Validate    check every colony, mark pass/fail, export a PDF report
