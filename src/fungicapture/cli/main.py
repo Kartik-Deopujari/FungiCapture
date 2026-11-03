@@ -91,6 +91,7 @@ def command_run(args) -> int:
         backend=args.backend,
         auto_centre=not args.no_auto_centre,
         skip_edge_wells=args.skip_edge_wells,
+        workers=args.workers,
     )
 
     if not args.quiet:
@@ -98,7 +99,11 @@ def command_run(args) -> int:
 
     exit_code = 0
     for result in results:
-        print(result.summary())
+        timing = ""
+        if "elapsed_s" in result.data:
+            workers = result.data.get("workers", 1)
+            timing = f"  [{result.data['elapsed_s']}s on {workers} worker(s)]"
+        print(result.summary() + timing)
         for warning in result.warnings:
             print(f"  note: {warning}")
         for name, error in result.errors[:10]:
@@ -221,6 +226,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--no-auto-centre", action="store_true")
     run.add_argument("--skip-edge-wells", action="store_true")
+    run.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "parallel worker threads for cropping, classical segmentation and "
+            "feature extraction (default: auto-detect from CPU count; the SAM 3 "
+            "model always runs serially). Also set by FUNGICAPTURE_WORKERS."
+        ),
+    )
     run.add_argument("-q", "--quiet", action="store_true")
     run.set_defaults(function=command_run)
 

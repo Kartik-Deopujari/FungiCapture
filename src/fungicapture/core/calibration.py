@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -659,6 +660,11 @@ class Calibrator:
         self._matrix: np.ndarray | None = None
         self._exif_records: list[dict[str, Any]] = []
         self.load_errors: list[str] = []
+        # One Calibrator is shared by every colony, and the feature step now
+        # measures colonies on several threads at once. This guards the only
+        # state that is written per image (the EXIF records gathered for the
+        # drift check, and the last-used correction matrix).
+        self._lock = threading.Lock()
 
         if params.use_colour_card and params.card_definition_path:
             try:
@@ -681,7 +687,8 @@ class Calibrator:
 
         if self.params.capture_exif and image_path is not None:
             result.exif = read_exif(image_path)
-            self._exif_records.append(result.exif)
+            with self._lock:
+                self._exif_records.append(result.exif)
 
         if self.params.background_normalise:
             working, gains = normalise_background(
@@ -723,7 +730,8 @@ class Calibrator:
                     )
                 else:
                     working = apply_correction(working, matrix)
-                    self._matrix = matrix
+                    with self._lock:
+                        self._matrix = matrix
                     result.card_found = True
                     result.method = "card"
 

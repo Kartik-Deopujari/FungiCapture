@@ -15,6 +15,8 @@ Every step:
 
 from __future__ import annotations
 
+import copy
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,6 +30,7 @@ from .calibration import Calibrator
 from .detect import centre_boxes_on_colonies, detect_dish, fit_grid
 from .features.extract import analysis_columns, extract_from_files, normalise_stem
 from .features.regions import load_rgb
+from .parallel import parallel_map, resolve_workers
 from .plate import (
     BoxGeometry,
     GridGeometry,
@@ -116,6 +119,7 @@ def crop_plates(
     auto_centre: bool = True,
     skip_edge_wells: bool = False,
     image_path: str | Path | None = None,
+    workers: int | None = None,
     progress: ProgressFn = _noop_progress,
 ) -> StepResult:
     """
@@ -196,54 +200,69 @@ def crop_plates(
         per_plate = len(boxes.boxes) if boxes is not None and boxes.boxes else 1
     else:
         per_plate = layout.rows * layout.cols
-    total_units = max(1, len(images) * per_plate)
-    state = {"done": 0, "cancelled": False}
+    result.data["workers"] = resolve_workers(workers, cap=len(images))
+    started_perf = time.perf_counter()
 
-    def bump(message: str) -> bool:
-        state["done"] += 1
-        if not progress(min(state["done"], total_units), total_units, message):
-            state["cancelled"] = True
-            return False
-        return True
-
-    for image_path in images:
-        if state["cancelled"]:
-            result.cancelled = True
-            break
-        # A message before the slow decode, without advancing the count.
-        progress(min(state["done"], total_units), total_units,
-                 f"Cropping {image_path.name}")
-        try:
-            rgb = load_rgb(image_path)
-
-            if dish_mode:
-                if boxes is not None and boxes.boxes:
-                    written = _crop_dish_boxes(
-                        project, rgb, image_path, boxes, plate_map,
-                        result, crops_root, bump,
-                    )
-                else:
-                    written = _crop_single_dish(
-                        project, rgb, image_path, plate_map, result, crops_root
-                    )
-                    bump(f"Cropped {image_path.name}")
-            else:
-                written = _crop_gridded(
-                    project, rgb, image_path, layout, grid, boxes,
-                    plate_map, auto_centre, skip_edge_wells, result, crops_root,
-                    bump,
+    # Each plate is cropped on its own worker thread. A plate is wholly
+    # independent of the others - it reads one photograph and writes that
+    # plate's wells - so there is no shared state to coordinate. Batch modes
+    # write each plate into its own sub-folder (set up inside the worker), and
+    # the single modes only ever crop one plate, so two threads never write the
+    # same file.
+    def crop_one(plate_path: Path) -> tuple[list[Path], list[str]]:
+        warnings: list[str] = []
+        rgb = load_rgb(plate_path)
+        # Each plate gets its own copy of the layout. The grid engine
+        # re-centres the boxes on *this* plate's colonies in place, so a shared
+        # layout object would be mutated by several threads at once - each
+        # plate would be cropped with another plate's box positions. A private
+        # copy keeps every plate's layout independent.
+        local_boxes = copy.deepcopy(boxes) if boxes is not None else None
+        if dish_mode:
+            if local_boxes is not None and local_boxes.boxes:
+                written = _crop_dish_boxes(
+                    project, rgb, plate_path, local_boxes, plate_map,
+                    warnings, crops_root,
                 )
-            result.outputs.extend(written)
-            result.n_outputs += len(written)
-        except Exception as error:
-            result.errors.append((str(image_path), str(error)))
-        if state["cancelled"]:
-            result.cancelled = True
-            break
+            else:
+                written = _crop_single_dish(
+                    project, rgb, plate_path, plate_map, warnings, crops_root
+                )
+        else:
+            written = _crop_gridded(
+                project, rgb, plate_path, layout, grid, local_boxes,
+                plate_map, auto_centre, skip_edge_wells, warnings, crops_root,
+            )
+        return written, warnings
 
+    run = parallel_map(
+        images,
+        crop_one,
+        workers=workers,
+        progress=progress,
+        # Progress is counted in colonies, not plates, so one plate cutting 96
+        # wells does not show "1 of 1". Each plate is worth ``per_plate`` units.
+        weight=lambda _p: per_plate,
+        label=lambda p: f"Cropping {p.name}",
+    )
+    result.cancelled = run.cancelled
+
+    for outcome in run.outcomes:
+        if outcome.error is not None:
+            result.errors.append((str(outcome.item), str(outcome.error)))
+            continue
+        written, warnings = outcome.result
+        result.warnings.extend(warnings)
+        result.outputs.extend(written)
+        result.n_outputs += len(written)
+
+    result.data["elapsed_s"] = round(time.perf_counter() - started_perf, 2)
     project.log_run(
         "crop", started, result.n_inputs, result.n_outputs, result.n_errors,
-        notes=f"mode={project.mode.value}",
+        notes=(
+            f"mode={project.mode.value}, workers={result.data['workers']}, "
+            f"{result.data['elapsed_s']}s"
+        ),
     )
     return result
 
@@ -253,15 +272,20 @@ def _crop_single_dish(
     rgb: np.ndarray,
     image_path: Path,
     plate_map: PlateMap | None,
-    result: StepResult,
+    warnings: list[str],
     crops_root: Path,
 ) -> list[Path]:
-    """Dish engine: find the rim, find the one colony, crop around it."""
+    """Dish engine: find the rim, find the one colony, crop around it.
+
+    Warnings are appended to the passed-in ``warnings`` list rather than to a
+    shared result object, so this can run on a worker thread without two plates
+    writing to the same list at once.
+    """
     import cv2
 
     dish = detect_dish(rgb)
     for warning in dish.warnings:
-        result.warnings.append(f"{image_path.name}: {warning}")
+        warnings.append(f"{image_path.name}: {warning}")
 
     if dish.colony is None:
         return []
@@ -296,9 +320,8 @@ def _crop_dish_boxes(
     image_path: Path,
     boxes: BoxGeometry,
     plate_map: PlateMap | None,
-    result: StepResult,
+    warnings: list[str],
     crops_root: Path,
-    bump: Callable[[str], bool] | None = None,
 ) -> list[Path]:
     """Dish engine, box variant: cut every hand-placed box.
 
@@ -326,16 +349,14 @@ def _crop_dish_boxes(
         destination = subdirectory / crop_filename(
             well.well_id, strain, project.media_label
         )
+        # PNG is lossless, so the exported colony is pixel-identical to the
+        # region of the original photograph - no quality is traded for speed.
         ok, buffer = cv2.imencode(
             ".png", cv2.cvtColor(well.image, cv2.COLOR_RGB2BGR)
         )
         if ok:
             buffer.tofile(str(destination))
             written.append(destination)
-        if bump is not None and not bump(
-            f"Cropping colony {well.well_id} on {image_path.name}"
-        ):
-            break
     return written
 
 
@@ -349,9 +370,8 @@ def _crop_gridded(
     plate_map: PlateMap | None,
     auto_centre: bool,
     skip_edge_wells: bool,
-    result: StepResult,
+    warnings: list[str],
     crops_root: Path,
-    bump: Callable[[str], bool] | None = None,
 ) -> list[Path]:
     """Grid engine: fit or reuse a layout, then cut every well."""
     import cv2
@@ -363,9 +383,9 @@ def _crop_gridded(
         fit = fit_grid(rgb, layout.rows, layout.cols, margin=layout.margin)
         plate_grid = GridGeometry(fit.row_lines, fit.col_lines)
         for warning in fit.warnings:
-            result.warnings.append(f"{image_path.name}: {warning}")
+            warnings.append(f"{image_path.name}: {warning}")
         if fit.confidence < 0.5:
-            result.warnings.append(
+            warnings.append(
                 f"{image_path.name}: low grid confidence ({fit.confidence:.2f}) - "
                 "check this plate by eye."
             )
@@ -398,19 +418,16 @@ def _crop_gridded(
         destination = subdirectory / crop_filename(
             well.well_id, strain, project.media_label
         )
+        # Lossless PNG: the exported well is pixel-identical to the crop.
         ok, buffer = cv2.imencode(
             ".png", cv2.cvtColor(well.image, cv2.COLOR_RGB2BGR)
         )
         if ok:
             buffer.tofile(str(destination))
             written.append(destination)
-        if bump is not None and not bump(
-            f"Cropping {well.well_id} on {image_path.name}"
-        ):
-            break
 
     if edge_wells:
-        result.warnings.append(
+        warnings.append(
             f"{image_path.name}: {len(edge_wells)} well(s) run off the edge of the "
             f"photograph ({', '.join(edge_wells[:6])}"
             f"{'...' if len(edge_wells) > 6 else ''}). They were still exported."
@@ -431,6 +448,7 @@ def segment_crops(
     backend: str = "auto",
     weights: str | Path | None = None,
     save_overlays: bool = True,
+    workers: int | None = None,
     progress: ProgressFn = _noop_progress,
 ) -> StepResult:
     """
@@ -481,45 +499,125 @@ def segment_crops(
     result.data["backend"] = segmenter.name
 
     masks_root.mkdir(parents=True, exist_ok=True)
+    started_perf = time.perf_counter()
 
-    for index, crop_path in enumerate(crops, start=1):
-        if not progress(index - 1, len(crops), f"Segmenting {crop_path.name}"):
-            result.cancelled = True
-            break
-        try:
+    # How the mask (and optional overlay) for one crop is written. Shared by
+    # both backends. Mirrors the crop's sub-folder into the mask folder so that
+    # two plates whose wells share a filename - which happens whenever a plate
+    # map is reused across plates - never write to the same mask path and
+    # silently overwrite each other. save_mask/save_overlay write lossless PNG.
+    def write_outputs(crop_path: Path, mask: np.ndarray) -> Path:
+        relative = crop_path.relative_to(crops_root)
+        mask_dir = masks_root / relative.parent
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        mask_path = mask_dir / f"{crop_path.stem}_mask.png"
+        save_mask(mask, mask_path)
+        if save_overlays:
+            save_overlay(
+                load_rgb(crop_path),
+                mask,
+                mask_dir / f"{crop_path.stem}_overlay.png",
+            )
+        return mask_path
+
+    if getattr(segmenter, "name", "") == "sam3":
+        # The AI model runs serially: one loaded model, one image at a time.
+        # Running copies of it in parallel is what makes the tool crash - they
+        # fight over GPU and system memory. What we *can* overlap safely is the
+        # disk writing: a single background writer saves each crop's mask and
+        # overlay while the model is already working on the next crop, so the
+        # model never waits on the disk.
+        _segment_with_model(
+            segmenter, crops, crops_root, write_outputs, workers, result, progress
+        )
+    else:
+        # The classical backend is pure CPU work with no model, so every crop
+        # can be segmented on its own thread.
+        result.data["workers"] = resolve_workers(workers, cap=len(crops))
+
+        def segment_one(crop_path: Path) -> tuple[Path, list[str]]:
             segmentation = segment_image(segmenter, crop_path)
-            for warning in segmentation.warnings:
-                result.warnings.append(f"{crop_path.name}: {warning}")
+            warnings = [f"{crop_path.name}: {w}" for w in segmentation.warnings]
+            mask_path = write_outputs(crop_path, segmentation.mask)
+            return mask_path, warnings
 
-            # Mirror the crop's folder structure into the mask folder.
-            # Without this, two plates whose wells share a filename - which
-            # happens whenever a plate map is reused across plates - write to
-            # the same mask path, and the second plate silently overwrites the
-            # first. Every colony of the first plate would then be measured
-            # against another plate's mask.
-            relative = crop_path.relative_to(crops_root)
-            mask_dir = masks_root / relative.parent
-            mask_dir.mkdir(parents=True, exist_ok=True)
-
-            mask_path = mask_dir / f"{crop_path.stem}_mask.png"
-            save_mask(segmentation.mask, mask_path)
+        run = parallel_map(
+            crops,
+            segment_one,
+            workers=workers,
+            progress=progress,
+            label=lambda p: f"Segmenting {p.name}",
+        )
+        result.cancelled = run.cancelled
+        for outcome in run.outcomes:
+            if outcome.error is not None:
+                result.errors.append((str(outcome.item), str(outcome.error)))
+                continue
+            mask_path, warnings = outcome.result
+            result.warnings.extend(warnings)
             result.outputs.append(mask_path)
             result.n_outputs += 1
 
-            if save_overlays:
-                save_overlay(
-                    load_rgb(crop_path),
-                    segmentation.mask,
-                    mask_dir / f"{crop_path.stem}_overlay.png",
-                )
-        except Exception as error:
-            result.errors.append((str(crop_path), str(error)))
-
+    result.data["elapsed_s"] = round(time.perf_counter() - started_perf, 2)
     project.log_run(
         "segment", started, result.n_inputs, result.n_outputs, result.n_errors,
-        notes=f"backend={result.data.get('backend')}",
+        notes=(
+            f"backend={result.data.get('backend')}, "
+            f"workers={result.data.get('workers', 1)}, {result.data['elapsed_s']}s"
+        ),
     )
     return result
+
+
+def _segment_with_model(
+    segmenter,
+    crops: list[Path],
+    crops_root: Path,
+    write_outputs: Callable[[Path, np.ndarray], Path],
+    workers: int | None,
+    result: StepResult,
+    progress: ProgressFn,
+) -> None:
+    """
+    Run the SAM 3 model over every crop, serially, overlapping disk writes.
+
+    The model inference stays on the calling thread - one model, one image at a
+    time - because that is the only stable way to use it. A single background
+    writer thread saves the mask and overlay for a crop while the model moves on
+    to the next, so time spent encoding and writing PNGs is hidden behind the
+    next inference instead of adding to it.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    result.data["workers"] = 1  # one model; writes overlap on one helper thread
+    # (crop_path, mask_path future) for each crop whose inference succeeded.
+    pending: list[tuple[Path, Any]] = []
+
+    writer = ThreadPoolExecutor(max_workers=1)
+    try:
+        for index, crop_path in enumerate(crops, start=1):
+            if not progress(index - 1, len(crops), f"Segmenting {crop_path.name}"):
+                result.cancelled = True
+                break
+            try:
+                segmentation = segment_image(segmenter, crop_path)
+                for warning in segmentation.warnings:
+                    result.warnings.append(f"{crop_path.name}: {warning}")
+                future = writer.submit(write_outputs, crop_path, segmentation.mask)
+                pending.append((crop_path, future))
+            except Exception as error:  # noqa: BLE001 - recorded per crop
+                result.errors.append((str(crop_path), str(error)))
+    finally:
+        # Collect every write, so a failure to save is reported against the
+        # right crop rather than lost. wait=True lets in-flight writes finish.
+        for crop_path, future in pending:
+            try:
+                mask_path = future.result()
+                result.outputs.append(mask_path)
+                result.n_outputs += 1
+            except Exception as error:  # noqa: BLE001
+                result.errors.append((str(crop_path), str(error)))
+        writer.shutdown(wait=True)
 
 
 # --------------------------------------------------------------------------
@@ -621,6 +719,7 @@ def extract_features(
     output_dir: str | Path | None = None,
     include_histograms: bool = True,
     write_per_image: bool = True,
+    workers: int | None = None,
     progress: ProgressFn = _noop_progress,
 ) -> StepResult:
     """Measure every colony and write the feature table."""
@@ -658,45 +757,71 @@ def extract_features(
     if write_per_image:
         per_image_root.mkdir(parents=True, exist_ok=True)
 
-    rows: list[dict[str, Any]] = []
-    for index, (crop_path, mask_path) in enumerate(pairs, start=1):
-        if not progress(index - 1, len(pairs), f"Measuring {crop_path.name}"):
-            result.cancelled = True
-            break
+    result.data["workers"] = resolve_workers(workers, cap=len(pairs))
+    started_perf = time.perf_counter()
+
+    # Measuring one colony reads its crop and mask and computes its feature
+    # vector - wholly independent of every other colony - so this is done on
+    # several threads. The calibrator is shared and made thread-safe; the row
+    # itself is built here and returned, with no file writing on the worker, so
+    # there is nothing for two threads to collide over.
+    def measure_one(pair: tuple[Path, Path]) -> tuple[dict[str, Any], list[str]]:
+        crop_path, mask_path = pair
+        features = extract_from_files(
+            crop_path, mask_path, project.params,
+            include_histograms=include_histograms,
+            calibrator=calibrator,
+        )
+        warnings = [f"{crop_path.name}: {w}" for w in features.warnings]
+
+        row = features.as_row()
+        # base_key from the filename alone repeats across plates, so overwrite
+        # it with the project-unique key and record which plate the colony came
+        # from. Everything downstream - QC verdicts, feature joins, exclusion
+        # lists - keys on this.
+        row["base_key"] = colony_key(project, crop_path, crops_root)
         try:
-            features = extract_from_files(
-                crop_path, mask_path, project.params,
-                include_histograms=include_histograms,
-                calibrator=calibrator,
-            )
-            for warning in features.warnings:
-                result.warnings.append(f"{crop_path.name}: {warning}")
+            relative_parent = crop_path.relative_to(crops_root).parent
+        except ValueError:
+            relative_parent = Path(".")
+        row["plate_id"] = (
+            "" if relative_parent.as_posix() in (".", "")
+            else relative_parent.as_posix()
+        )
+        row.update(project.provenance())
+        return row, warnings
 
-            row = features.as_row()
-            # base_key from the filename alone repeats across plates, so
-            # overwrite it with the project-unique key and record which plate
-            # the colony came from. Everything downstream - QC verdicts,
-            # feature joins, exclusion lists - keys on this.
-            row["base_key"] = colony_key(project, crop_path, crops_root)
-            try:
-                relative_parent = crop_path.relative_to(crops_root).parent
-            except ValueError:
-                relative_parent = Path(".")
-            row["plate_id"] = (
-                "" if relative_parent.as_posix() in (".", "")
-                else relative_parent.as_posix()
-            )
-            row.update(project.provenance())
-            rows.append(row)
-            result.n_outputs += 1
+    run = parallel_map(
+        pairs,
+        measure_one,
+        workers=workers,
+        progress=progress,
+        label=lambda pair: f"Measuring {pair[0].name}",
+    )
+    result.cancelled = run.cancelled
 
-            if write_per_image:
-                pd.DataFrame([row]).to_csv(
-                    per_image_root / f"{crop_path.stem}_features.csv",
-                    index=False,
-                )
-        except Exception as error:
-            result.errors.append((str(crop_path), str(error)))
+    # Outcomes come back in the original pair order, so the feature table and
+    # the per-image files are written in the same order as the old serial loop.
+    rows: list[dict[str, Any]] = []
+    for outcome in run.outcomes:
+        crop_path = outcome.item[0]
+        if outcome.error is not None:
+            result.errors.append((str(crop_path), str(outcome.error)))
+            continue
+        row, warnings = outcome.result
+        result.warnings.extend(warnings)
+        rows.append(row)
+        result.n_outputs += 1
+        if write_per_image:
+            # Written here on the main thread, in order, so that if two plates
+            # share a crop name the later one wins - exactly as before - with no
+            # chance of two threads writing the same file at once.
+            pd.DataFrame([row]).to_csv(
+                per_image_root / f"{crop_path.stem}_features.csv",
+                index=False,
+            )
+
+    result.data["elapsed_s"] = round(time.perf_counter() - started_perf, 2)
 
     if rows:
         frame = pd.DataFrame(rows)
@@ -728,7 +853,10 @@ def extract_features(
 
     project.log_run(
         "features", started, result.n_inputs, result.n_outputs, result.n_errors,
-        notes=calibrator.describe(),
+        notes=(
+            f"{calibrator.describe()}, workers={result.data['workers']}, "
+            f"{result.data['elapsed_s']}s"
+        ),
     )
     return result
 
@@ -872,14 +1000,15 @@ def run_pipeline(
     accepted = {
         "crop": {
             "grid", "boxes", "plate_map", "auto_centre", "skip_edge_wells",
-            "input_dir", "output_dir", "image_path",
+            "input_dir", "output_dir", "image_path", "workers",
         },
         "segment": {
             "backend", "weights", "save_overlays", "input_dir", "output_dir",
+            "workers",
         },
         "features": {
             "include_histograms", "write_per_image",
-            "crops_dir", "masks_dir", "output_dir",
+            "crops_dir", "masks_dir", "output_dir", "workers",
         },
         "phenotypes": {
             "settings", "exclude_failed", "features_csv", "output_dir",
