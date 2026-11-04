@@ -51,6 +51,7 @@ class ValidateTab(QWidget):
         self._pairs: list[tuple[Path, Path]] = []
         self._features = None
         self._current = -1
+        self._crops_root: Path | None = None
 
         outer = QVBoxLayout(self)
 
@@ -175,9 +176,10 @@ class ValidateTab(QWidget):
             return
         from ...core.pipeline import pair_crops_and_masks
 
+        self._crops_root = self.folders["crops"].effective() or self.project.crops_dir
         self._pairs = pair_crops_and_masks(
             self.project,
-            self.folders["crops"].effective(),
+            self._crops_root,
             self.folders["masks"].effective(),
         )
 
@@ -192,16 +194,25 @@ class ValidateTab(QWidget):
         self.folders.refresh_status()
         self.refresh_list()
 
-    def refresh_list(self) -> None:
-        from ...core.features.extract import normalise_stem
+    def _colony_key(self, crop_path: Path) -> str:
+        """The project-unique key for a colony - the SAME key the feature step
+        writes as ``base_key`` and the verdict store records against. In batch
+        modes it includes the plate sub-folder, so colonies that share a
+        filename across plates are kept apart; keying on the bare filename stem
+        instead was why the panel numbers and the fail-exclusions did not line
+        up with the feature table."""
+        from ...core.pipeline import colony_key
 
+        return colony_key(self.project, crop_path, self._crops_root)
+
+    def refresh_list(self) -> None:
         if self.verdicts is None:
             return
         wanted = self.filter.currentText()
         self.colony_list.clear()
 
         for crop_path, _ in self._pairs:
-            key = normalise_stem(crop_path.stem)
+            key = self._colony_key(crop_path)
             status = self.verdicts.get(key).status
             if wanted != "all" and status != wanted:
                 continue
@@ -246,11 +257,10 @@ class ValidateTab(QWidget):
         """
         import tempfile
 
-        from ...core.features.extract import normalise_stem
         from ...core.validate import build_panel_data, make_panel, save_panel
 
         assert self.project is not None
-        key = normalise_stem(crop_path.stem)
+        key = self._colony_key(crop_path)
 
         values: dict = {}
         if self._features is not None and "base_key" in self._features.columns:
@@ -263,7 +273,10 @@ class ValidateTab(QWidget):
                 crop_path, mask_path, values, self.project.params
             )
             figure = make_panel(data, self.project.params, figsize=(15, 8.5))
-            temporary = Path(tempfile.gettempdir()) / f"fungicapture_qc_{key}.png"
+            # The key can contain a plate sub-folder ("plate/colony"); flatten it
+            # so it is a valid single filename.
+            safe = key.replace("/", "_").replace("\\", "_")
+            temporary = Path(tempfile.gettempdir()) / f"fungicapture_qc_{safe}.png"
             save_panel(figure, temporary, dpi=100)
         except Exception as error:
             self.panel_label.setText(f"Could not build the panel:\n{error}")
@@ -281,12 +294,10 @@ class ValidateTab(QWidget):
             self.colony_list.setCurrentRow(row)
 
     def _set_verdict(self, status: str) -> None:
-        from ...core.features.extract import normalise_stem
-
         item = self.colony_list.currentItem()
         if item is None or self.verdicts is None:
             return
-        key = normalise_stem(Path(item.data(Qt.UserRole)).stem)
+        key = self._colony_key(Path(item.data(Qt.UserRole)))
         self.verdicts.set(key, status, self.note.text())
         self.verdicts.save()
         self.status_message.emit(f"{key} marked {status}")
@@ -333,5 +344,11 @@ class ValidateTab(QWidget):
         )
         if path:
             self.request_run.emit(
-                "report", {"path": path, "mode": mode, "pairs": self._pairs}
+                "report",
+                {
+                    "path": path,
+                    "mode": mode,
+                    "pairs": self._pairs,
+                    "crops_root": str(self._crops_root) if self._crops_root else "",
+                },
             )

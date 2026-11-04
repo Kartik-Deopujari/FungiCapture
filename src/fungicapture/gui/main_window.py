@@ -279,16 +279,22 @@ class MainWindow(QMainWindow):
         # panels: the report was built with no values at all, so every feature
         # was blank even though the CSV held them.
         feature_lookup = self._load_feature_values()
+        # Feature rows are keyed by the project-unique colony key (which includes
+        # the plate sub-folder in batch modes), so the panel numbers must be
+        # looked up by that same key, not by the bare filename stem.
+        crops_root = options.get("crops_root") or str(project.crops_dir)
 
         def job(progress):
-            from ..core.features.extract import normalise_stem
+            from ..core.pipeline import colony_key
 
             store = VerdictStore(project.qc_dir / VerdictStore.FILENAME)
             panels = []
             for index, (crop_path, mask_path) in enumerate(pairs, start=1):
                 if not progress(index, len(pairs), f"Preparing {crop_path.name}"):
                     break
-                values = feature_lookup.get(normalise_stem(crop_path.stem), {})
+                values = feature_lookup.get(
+                    colony_key(project, crop_path, crops_root), {}
+                )
                 try:
                     panels.append(
                         build_panel_data(
