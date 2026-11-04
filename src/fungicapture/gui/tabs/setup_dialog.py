@@ -154,10 +154,13 @@ class SegmentationSetupDialog(QDialog):
 
         self._handle = run_in_background(
             job,
-            on_progress=lambda done, total, message: self._append(message),
+            on_progress=self._on_progress,
             on_finished=self._done,
             on_failed=self._failed,
         )
+
+    def _on_progress(self, done: int, total: int, message: str) -> None:
+        self._append(message)
 
     def _append(self, message: str) -> None:
         if message:
