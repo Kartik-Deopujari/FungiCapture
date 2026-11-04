@@ -65,11 +65,18 @@ class PhenotypeSettings:
     """How many PC scores to export as phenotypes."""
 
     outlier_alpha: float = 0.001
-    """Chi-squared p-value below which a colony is flagged. Deliberately
-    strict, so only genuinely extreme colonies are marked."""
+    """Adjusted p-value below which a colony is flagged as an outlier.
+    Deliberately strict, so only genuinely extreme colonies are marked. See
+    ``flag_outliers`` for how the (robust, small-sample-safe) p-value is formed."""
 
     outlier_n_pcs: int = 10
-    """PCs used for the Mahalanobis distance."""
+    """PCs examined by the outlier test."""
+
+    min_samples_per_feature: float = 3.0
+    """Below roughly this many colonies per kept feature, PCA scores for a
+    medium are only exploratory and are flagged as such (``pca_reliable``). When
+    there are fewer colonies than features the axes are not even uniquely
+    determined, and the variance-explained figures are optimistic."""
 
     stratify_by_media: bool = True
     """Standardise and fit separately for each growth medium. Colonies on MEX
@@ -193,7 +200,7 @@ def score_media(
     n_full = min(scaled_all.shape[0], scaled_all.shape[1])
     scores_all = PCA(n_components=n_full, random_state=0).fit_transform(scaled_all)
 
-    is_outlier, distances, p_values = flag_outliers(
+    is_outlier, outlier_score, outlier_p = flag_outliers(
         scores_all, settings.outlier_n_pcs, settings.outlier_alpha
     )
     n_outliers = int(is_outlier.sum())
@@ -229,16 +236,40 @@ def score_media(
             model.explained_variance_ratio_[i] * 100
         )
 
+    n_features = len(features)
+    reliable = n_samples > n_features
     table["is_outlier"] = is_outlier.astype(int)
-    table["mahalanobis_d2"] = distances
-    table["outlier_p"] = p_values
-    table["n_features_used"] = len(features)
+    table["outlier_score"] = outlier_score  # largest robust z across the PCs
+    table["outlier_p"] = outlier_p
+    table["n_features_used"] = n_features
+    # 1 only when there are more colonies than features, so a downstream user can
+    # filter out media whose scores are statistically under-determined.
+    table["pca_reliable"] = int(reliable)
 
     loadings = pd.DataFrame(
         model.components_.T,
         index=features,
         columns=[f"PC{i + 1}" for i in range(model.n_components_)],
     )
+
+    # Reliability of the PCA itself. This must be a SEPARATE check from the
+    # weak-PC1 warning below: when there are few colonies, PC1's variance-
+    # explained is artificially HIGH, so the weak-PC1 test stays silent exactly
+    # when the result is least trustworthy. Say so plainly instead.
+    if not reliable:
+        warnings.append(
+            f"{media}: {n_samples} colonies but {n_features} features - fewer "
+            "colonies than features. The PCA axes are not uniquely determined "
+            "and the variance-explained figures are optimistic; treat these "
+            "scores as exploratory, not definitive (pca_reliable=0)."
+        )
+    elif n_samples < settings.min_samples_per_feature * n_features:
+        warnings.append(
+            f"{media}: {n_samples} colonies for {n_features} features, below the "
+            f"~{settings.min_samples_per_feature:g}x colonies-per-feature "
+            "guideline. PC scores here are provisional - prefer more colonies "
+            "per medium, or fewer features."
+        )
 
     if model.explained_variance_ratio_[0] < 0.15:
         warnings.append(
@@ -263,21 +294,28 @@ def flag_outliers(
     scores: np.ndarray, n_pcs: int, alpha: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Find colonies that are extreme across several dimensions at once.
+    Find colonies that are extreme on the principal-component axes.
 
-    Mahalanobis distance measures how far a point is from the centre *in units
-    of the data's own spread*, accounting for correlations between axes. A
-    colony can be unremarkable on every single feature yet sit far from the
-    cloud in combination - that is what this catches and a per-feature
-    threshold misses.
+    For each of the first ``k`` PCs we measure how far a colony sits from the
+    **median**, in robust standard deviations - the median absolute deviation
+    (MAD) scaled by 1.4826 so it matches a normal standard deviation. A colony
+    is flagged when its most extreme PC crosses a threshold derived from
+    ``alpha`` (a two-sided tail, Bonferroni-adjusted for examining ``k`` PCs).
 
-    Under a multivariate normal the squared distance follows a chi-squared
-    distribution with ``k`` degrees of freedom, which turns a distance into a
-    p-value.
+    Why not a Mahalanobis distance from the sample covariance (the previous
+    method): at the sample sizes here - tens of colonies per medium, often with
+    more features than colonies - that distance is mathematically bounded by
+    (n-1)^2/n and can never reach the usual chi-squared threshold, so it flagged
+    nothing; and because it uses the ordinary mean and covariance, two bad
+    colonies inflate the very spread used to judge them and mask each other.
+    Median and MAD are resistant to the outliers themselves and work at small n.
 
-    Returns ``(is_outlier, squared_distances, p_values)``.
+    Returns ``(is_outlier, outlier_score, outlier_p)`` where ``outlier_score`` is
+    the largest robust z across the ``k`` PCs and ``outlier_p`` is its two-sided,
+    Bonferroni-adjusted tail probability (clipped to [0, 1]) - a value that is a
+    genuine probability, unlike the old bounded chi-squared tail.
     """
-    from scipy.stats import chi2
+    from scipy.stats import norm
 
     n_samples = scores.shape[0]
     k = int(min(n_pcs, scores.shape[1], max(1, n_samples - 1)))
@@ -288,20 +326,23 @@ def flag_outliers(
             np.full(n_samples, np.nan),
         )
 
-    subset = scores[:, :k]
-    centre = subset.mean(axis=0)
-    difference = subset - centre
+    subset = scores[:, :k].astype(float)
+    median = np.median(subset, axis=0)
+    mad = np.median(np.abs(subset - median), axis=0)
+    scale = mad * 1.4826  # MAD -> standard-deviation-equivalent under normality
 
-    covariance = np.cov(subset, rowvar=False)
-    covariance = np.atleast_2d(covariance)
-    # Pseudo-inverse, not inverse: with more features than colonies the
-    # covariance matrix is singular and a plain inverse would raise.
-    inverse = np.linalg.pinv(covariance)
+    # A PC with no robust spread (scale 0, e.g. a near-duplicate axis) carries no
+    # outlier information; guard the divide so it contributes a z of 0, never
+    # inf/nan.
+    robust_z = np.zeros_like(subset)
+    usable = scale > 0
+    robust_z[:, usable] = (subset[:, usable] - median[usable]) / scale[usable]
 
-    squared = np.einsum("ij,jk,ik->i", difference, inverse, difference)
-    squared = np.clip(squared, 0, None)
-    p_values = 1.0 - chi2.cdf(squared, df=k)
-    return p_values < alpha, squared, p_values
+    outlier_score = np.abs(robust_z).max(axis=1)
+    # Two-sided normal tail for the worst PC, Bonferroni-adjusted across k PCs.
+    outlier_p = np.clip(2.0 * norm.sf(outlier_score) * k, 0.0, 1.0)
+    is_outlier = outlier_p < alpha
+    return is_outlier, outlier_score, outlier_p
 
 
 # --------------------------------------------------------------------------

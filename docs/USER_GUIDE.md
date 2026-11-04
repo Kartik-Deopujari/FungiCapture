@@ -401,11 +401,14 @@ review and are worth knowing before you trust a number.
   inconsistently between the brightness and colour measurements, which can
   distort the melanization score. If you only have 16-bit files, convert to 8-bit
   before import until this is fixed.
-- **Small groups make scoring unreliable.** If a growth medium has only a handful
-  of colonies, the PCA "variance explained" and the automatic outlier flag are
-  not trustworthy at that size. Treat phenotype scores from small groups with
-  caution, and lean on the **Validate** tab to catch bad colonies by eye rather
-  than relying on the automatic outlier flag.
+- **Small groups give exploratory scores.** If a growth medium has fewer
+  colonies than measured features, the PCA axes are not uniquely determined and
+  the "variance explained" is optimistic. The scoring now flags this: such a
+  group is marked `pca_reliable = 0` in the score table and carries a warning.
+  Treat those scores as exploratory, and still use the **Validate** tab to catch
+  bad colonies by eye. (The automatic outlier flag now works at small sample
+  sizes — a genuinely extreme colony is marked `is_outlier = 1` — but it flags,
+  it does not delete, so the final say is yours.)
 - **Use the per-medium phenotype files, not the combined one, for GWAS.** The
   combined `phenotypes_all_media.*` file stacks scores from separate per-medium
   analyses whose axes do not mean the same thing, so it is only safe for a quick
