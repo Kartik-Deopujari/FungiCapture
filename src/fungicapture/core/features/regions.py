@@ -275,7 +275,18 @@ def load_gray(path) -> np.ndarray:
 
 
 def load_rgb(path) -> np.ndarray:
-    """Read an image as 8-bit RGB, for the colour features."""
+    """Read an image as 8-bit RGB, for the colour features.
+
+    Scaling of a non-8-bit image (for example a 16-bit scanner or microscope
+    TIFF) is **absolute** - by the dtype's full range - the same scaling
+    ``load_gray`` uses, not a stretch to each image's own brightest pixel. A
+    per-image stretch made the identical colony read brighter or darker from one
+    photograph to the next, which broke the cross-plate colour comparability the
+    whole calibration chain exists to provide, and disagreed with the grayscale
+    path so the same dark colony could read 'dark' in the intensity features and
+    'bright' in the colour features. The conversion is done in float32, not
+    float64, which halves the transient memory of a large image.
+    """
     img = read_image(path)
     if img.ndim == 2:
         img = np.stack([img] * 3, axis=-1)
@@ -284,14 +295,26 @@ def load_rgb(path) -> np.ndarray:
     elif img.ndim == 3 and img.shape[2] > 4:
         img = img[..., :3]
 
-    if img.dtype != np.uint8:
-        peak = float(img.max())
-        img = (
-            (img.astype(np.float64) / peak * 255).astype(np.uint8)
-            if peak > 0
-            else img.astype(np.uint8)
-        )
-    return img
+    if img.dtype == np.uint8:
+        return img
+
+    if np.issubdtype(img.dtype, np.integer):
+        # Absolute scaling by the dtype range, e.g. uint16 0-65535 -> 0-255.
+        info = np.iinfo(img.dtype)
+        scaled = img.astype(np.float32)
+        if info.min < 0:  # signed: shift so the range starts at zero
+            scaled = scaled - float(info.min)
+        full = float(info.max) - float(info.min)
+        return np.clip(scaled / full * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    # Floating-point image: assume it is already in [0, 1]. Only if it overshoots
+    # do we fall back to a peak scale (matching load_gray) rather than clipping
+    # everything above 1 to white.
+    scaled = img.astype(np.float32)
+    peak = float(scaled.max()) if scaled.size else 0.0
+    if peak > 1.0:
+        scaled = scaled / peak
+    return np.clip(scaled * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
 def build_regions(mask: np.ndarray, params: RingParams) -> Regions:

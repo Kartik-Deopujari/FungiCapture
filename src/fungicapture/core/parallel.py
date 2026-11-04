@@ -29,8 +29,9 @@ left behind.
 
 from __future__ import annotations
 
+import contextlib
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -44,30 +45,93 @@ R = TypeVar("R")
 # the ``--workers`` flag.
 _DEFAULT_MAX_WORKERS = 8
 
+# When auto-sizing by memory, use at most this fraction of the memory that is
+# actually available, leaving headroom for the rest of the program and the OS.
+_RAM_SAFETY_FRACTION = 0.6
+
 # progress(done, total, message) -> False to cancel. ``done`` and ``total`` are
 # in *weight* units (see ``parallel_map``), not always item counts.
 ProgressFn = Callable[[int, int, str], bool]
 
 
-def resolve_workers(requested: int | None = None, *, cap: int | None = None) -> int:
+def _available_cpus() -> int:
+    """Cores this process may actually use, not the host's core count.
+
+    On Linux ``sched_getaffinity`` reflects CPU affinity and the cgroup cpuset a
+    container is pinned to, so a 2-core slice of a 64-core node reads as 2 - the
+    plain ``os.cpu_count()`` would wrongly read 64 and oversubscribe. Falls back
+    to ``cpu_count`` where affinity is unavailable (macOS, Windows).
+    """
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def _available_ram_bytes() -> int | None:
+    """Best-effort free memory in bytes, container-aware, or None if unknown.
+
+    Takes the smaller of the host's MemAvailable and, when present, the cgroup
+    memory limit minus current usage - so a container with a small memory limit
+    on a large host is sized by the limit, not the host. Any read failure yields
+    None, which simply disables the memory cap (never a crash).
+    """
+    candidates: list[int] = []
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    candidates.append(int(line.split()[1]) * 1024)
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    try:  # cgroup v2
+        with open("/sys/fs/cgroup/memory.max") as handle:
+            raw = handle.read().strip()
+        if raw and raw != "max":
+            limit = int(raw)
+            used = 0
+            try:
+                with open("/sys/fs/cgroup/memory.current") as handle:
+                    used = int(handle.read().strip())
+            except (OSError, ValueError):
+                used = 0
+            candidates.append(max(0, limit - used))
+    except (OSError, ValueError):
+        pass
+    return min(candidates) if candidates else None
+
+
+def resolve_workers(
+    requested: int | None = None,
+    *,
+    cap: int | None = None,
+    mem_per_worker_bytes: int | None = None,
+) -> int:
     """
     Decide how many worker threads to use.
 
     Order of preference:
 
     1. ``requested`` when it is a positive number - an explicit choice always
-       wins.
+       wins, and is honoured as-is (only clamped to ``cap``).
     2. The ``FUNGICAPTURE_WORKERS`` environment variable, so a cluster job
-       script can set it once.
-    3. The machine's CPU count, capped at ``_DEFAULT_MAX_WORKERS``.
+       script can set it once. Also treated as an explicit choice.
+    3. Auto: the cores this process may actually use (affinity/cgroup aware),
+       capped at ``_DEFAULT_MAX_WORKERS``, and - when ``mem_per_worker_bytes`` is
+       given - further capped so the workers together fit in available RAM.
 
     The result is always at least 1, and never more than ``cap`` (pass the
-    number of items so we never start more threads than there is work for).
+    number of items so we never start more threads than there is work for). The
+    RAM cap applies only to the auto path: if the user or a job script asked for
+    a specific number, we trust it.
     """
     workers = 0
+    explicit = False
 
     if requested is not None and requested > 0:
         workers = int(requested)
+        explicit = True
     else:
         env = os.environ.get("FUNGICAPTURE_WORKERS", "").strip()
         if env:
@@ -75,18 +139,71 @@ def resolve_workers(requested: int | None = None, *, cap: int | None = None) -> 
                 parsed = int(env)
                 if parsed > 0:
                     workers = parsed
+                    explicit = True
             except ValueError:
                 # A malformed env var should not crash a run; fall through to
                 # auto-detection rather than failing.
                 workers = 0
 
-    if workers <= 0:
-        workers = min(os.cpu_count() or 1, _DEFAULT_MAX_WORKERS)
+    if not explicit:
+        workers = min(_available_cpus(), _DEFAULT_MAX_WORKERS)
+        if mem_per_worker_bytes and mem_per_worker_bytes > 0:
+            available = _available_ram_bytes()
+            if available is not None:
+                ram_workers = int(available * _RAM_SAFETY_FRACTION // mem_per_worker_bytes)
+                workers = min(workers, max(1, ram_workers))
 
     workers = max(1, workers)
     if cap is not None:
         workers = max(1, min(workers, cap))
     return workers
+
+
+@contextlib.contextmanager
+def limit_native_threads(active: bool = True) -> Iterator[None]:
+    """
+    Pin the native maths libraries to one thread each for the duration.
+
+    numpy/BLAS, OpenMP (used by LibRaw) and OpenCV each run their own internal
+    thread pool. When we already run several items on our own worker threads,
+    those inner pools multiply out - N workers x ~4 native threads on an 8-core
+    machine - and oversubscribe the CPU, which measurably *loses* speed. Limiting
+    the inner pools to one thread while our pool owns the parallelism avoids that.
+
+    Only active when ``active`` is true (i.e. we are actually running more than
+    one worker); with a single worker the inner pools should use every core. Best
+    effort: if ``threadpoolctl`` or OpenCV is absent, the missing part is skipped.
+    """
+    if not active:
+        yield
+        return
+
+    stack = contextlib.ExitStack()
+    cv2_previous: int | None = None
+    try:
+        import cv2
+
+        cv2_previous = cv2.getNumThreads()
+        cv2.setNumThreads(1)
+    except Exception:
+        cv2_previous = None
+    try:
+        from threadpoolctl import threadpool_limits
+
+        stack.enter_context(threadpool_limits(limits=1))
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        stack.close()
+        if cv2_previous is not None:
+            try:
+                import cv2
+
+                cv2.setNumThreads(cv2_previous)
+            except Exception:
+                pass
 
 
 @dataclass
@@ -181,7 +298,12 @@ def parallel_map(
         outcome: ItemOutcome[T, R] = ItemOutcome(index=index, item=it)
         try:
             outcome.result = work(it)
-        except BaseException as error:  # noqa: BLE001 - captured per item on purpose
+        except Exception as error:  # noqa: BLE001 - captured per item on purpose
+            # Exception (not BaseException): a per-item failure, including
+            # MemoryError, is recorded and the run continues. KeyboardInterrupt
+            # and SystemExit are NOT Exceptions, so they propagate - Ctrl+C can
+            # still stop the run on the serial path, where work() runs here on
+            # the calling thread.
             outcome.error = error
         outcomes[index] = outcome
 
@@ -227,7 +349,7 @@ def parallel_map(
                 outcome = ItemOutcome(index=index, item=it)
                 try:
                     outcome.result = future.result()
-                except BaseException as error:  # noqa: BLE001
+                except Exception as error:  # noqa: BLE001 - per-item failure, incl. MemoryError
                     outcome.error = error
                 outcomes[index] = outcome
                 done_weight += item_weight(it)

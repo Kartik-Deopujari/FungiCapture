@@ -30,7 +30,7 @@ from .calibration import Calibrator
 from .detect import centre_boxes_on_colonies, detect_dish, fit_grid
 from .features.extract import analysis_columns, extract_from_files, normalise_stem
 from .features.regions import load_rgb
-from .parallel import parallel_map, resolve_workers
+from .parallel import limit_native_threads, parallel_map, resolve_workers
 from .plate import (
     BoxGeometry,
     GridGeometry,
@@ -55,6 +55,30 @@ ProgressFn = Callable[[int, int, str], bool]
 
 def _noop_progress(done: int, total: int, message: str) -> bool:
     return True
+
+
+def _estimate_decoded_bytes(path: Path) -> int:
+    """
+    Roughly how much memory decoding this photograph will take, in bytes.
+
+    Used only to cap the auto worker count so a batch of big photographs does
+    not launch more simultaneous decodes than will fit in RAM. A header read
+    (no full decode) gives the pixel count for ordinary raster formats; a camera
+    RAW, which PIL cannot open, is approximated from its compressed file size.
+    Any failure returns 0, which simply disables the memory cap for that run.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+        return int(width) * int(height) * 3  # 8-bit RGB
+    except Exception:
+        try:
+            # RAW decodes to several times its on-disk (compressed) size.
+            return Path(path).stat().st_size * 4
+        except OSError:
+            return 0
 
 
 @dataclass
@@ -200,7 +224,17 @@ def crop_plates(
         per_plate = len(boxes.boxes) if boxes is not None and boxes.boxes else 1
     else:
         per_plate = layout.rows * layout.cols
-    result.data["workers"] = resolve_workers(workers, cap=len(images))
+    # Each worker holds one full-resolution photograph in memory while it cuts
+    # the wells. Estimate that cost from the first photo and let resolve_workers
+    # cap the auto worker count so a batch of big RAW/TIFF plates cannot launch
+    # more simultaneous decodes than fit in RAM (×3 for working copies and the
+    # PNG encode buffers).
+    estimated = _estimate_decoded_bytes(images[0]) if images else 0
+    n_workers = resolve_workers(
+        workers, cap=len(images),
+        mem_per_worker_bytes=(estimated * 3) or None,
+    )
+    result.data["workers"] = n_workers
     started_perf = time.perf_counter()
 
     # Each plate is cropped on its own worker thread. A plate is wholly
@@ -235,16 +269,17 @@ def crop_plates(
             )
         return written, warnings
 
-    run = parallel_map(
-        images,
-        crop_one,
-        workers=workers,
-        progress=progress,
-        # Progress is counted in colonies, not plates, so one plate cutting 96
-        # wells does not show "1 of 1". Each plate is worth ``per_plate`` units.
-        weight=lambda _p: per_plate,
-        label=lambda p: f"Cropping {p.name}",
-    )
+    with limit_native_threads(n_workers > 1):
+        run = parallel_map(
+            images,
+            crop_one,
+            workers=n_workers,
+            progress=progress,
+            # Progress is counted in colonies, not plates, so one plate cutting
+            # 96 wells does not show "1 of 1". Each plate is worth ``per_plate``.
+            weight=lambda _p: per_plate,
+            label=lambda p: f"Cropping {p.name}",
+        )
     result.cancelled = run.cancelled
 
     for outcome in run.outcomes:
@@ -533,7 +568,8 @@ def segment_crops(
     else:
         # The classical backend is pure CPU work with no model, so every crop
         # can be segmented on its own thread.
-        result.data["workers"] = resolve_workers(workers, cap=len(crops))
+        n_workers = resolve_workers(workers, cap=len(crops))
+        result.data["workers"] = n_workers
 
         def segment_one(crop_path: Path) -> tuple[Path, list[str]]:
             segmentation = segment_image(segmenter, crop_path)
@@ -541,13 +577,14 @@ def segment_crops(
             mask_path = write_outputs(crop_path, segmentation.mask)
             return mask_path, warnings
 
-        run = parallel_map(
-            crops,
-            segment_one,
-            workers=workers,
-            progress=progress,
-            label=lambda p: f"Segmenting {p.name}",
-        )
+        with limit_native_threads(n_workers > 1):
+            run = parallel_map(
+                crops,
+                segment_one,
+                workers=n_workers,
+                progress=progress,
+                label=lambda p: f"Segmenting {p.name}",
+            )
         result.cancelled = run.cancelled
         for outcome in run.outcomes:
             if outcome.error is not None:
@@ -757,7 +794,8 @@ def extract_features(
     if write_per_image:
         per_image_root.mkdir(parents=True, exist_ok=True)
 
-    result.data["workers"] = resolve_workers(workers, cap=len(pairs))
+    n_workers = resolve_workers(workers, cap=len(pairs))
+    result.data["workers"] = n_workers
     started_perf = time.perf_counter()
 
     # Measuring one colony reads its crop and mask and computes its feature
@@ -791,13 +829,14 @@ def extract_features(
         row.update(project.provenance())
         return row, warnings
 
-    run = parallel_map(
-        pairs,
-        measure_one,
-        workers=workers,
-        progress=progress,
-        label=lambda pair: f"Measuring {pair[0].name}",
-    )
+    with limit_native_threads(n_workers > 1):
+        run = parallel_map(
+            pairs,
+            measure_one,
+            workers=n_workers,
+            progress=progress,
+            label=lambda pair: f"Measuring {pair[0].name}",
+        )
     result.cancelled = run.cancelled
 
     # Outcomes come back in the original pair order, so the feature table and
