@@ -41,6 +41,16 @@ from skimage import color
 
 from .params import CalibrationParams
 
+# The colour correction is a linear model with four parameters per output
+# channel: the three input channels (R, G, B) plus a constant (black-level)
+# term. The residual only measures read quality when there are clearly MORE
+# patches than parameters; with four or fewer the least-squares fit is exact and
+# the residual is ~0 whatever was read, so a bad card would pass the quality
+# gate. We therefore refuse to apply a card correction below a small margin
+# above the parameter count, and judge quality by a held-out residual.
+_CORRECTION_PARAMS = 4
+_MIN_CARD_PATCHES = _CORRECTION_PARAMS + 2  # need real degrees of freedom
+
 # --------------------------------------------------------------------------
 # Card definition - supplied by the user
 # --------------------------------------------------------------------------
@@ -531,24 +541,63 @@ def fit_colour_correction(
     enough for lamp and white-balance drift, and simple enough that it cannot
     invent structure that is not there.
 
-    Returns ``(matrix, residual_dE)`` where the residual is the mean CIE76
-    colour difference across patches after correction.
+    Returns ``(matrix, residual_dE)``. The matrix is fitted on all patches, but
+    the residual is a **leave-one-out** mean CIE76 colour difference: each patch
+    is predicted by a fit on the others, so the number reflects how well the
+    correction generalises, not how well it memorised its own patches. With a
+    plain training residual a four-patch card reads 0 dE however bad the capture;
+    the held-out residual does not. When there are too few patches to hold one
+    out with a determined fit, the training residual is returned as a fallback -
+    but the caller refuses to apply a correction that small anyway (see
+    ``_MIN_CARD_PATCHES``).
     """
     reference_rgb = color.lab2rgb(card.reference_lab.reshape(-1, 1, 3)).reshape(-1, 3)
 
     n = min(len(measured_rgb), len(reference_rgb))
     measured = measured_rgb[:n]
     reference = reference_rgb[:n]
+    reference_lab = card.reference_lab[:n]
 
     augmented = np.hstack([measured, np.ones((n, 1))])
     matrix, *_ = np.linalg.lstsq(augmented, reference, rcond=None)
 
-    corrected = np.clip(augmented @ matrix, 0, 1)
-    corrected_lab = color.rgb2lab(corrected.reshape(-1, 1, 3)).reshape(-1, 3)
-    residual = float(
-        np.mean(np.linalg.norm(corrected_lab - card.reference_lab[:n], axis=1))
-    )
+    held_out = _leave_one_out_residual_dE(measured, reference, reference_lab)
+    if held_out is not None:
+        residual = held_out
+    else:
+        corrected = np.clip(augmented @ matrix, 0, 1)
+        corrected_lab = color.rgb2lab(corrected.reshape(-1, 1, 3)).reshape(-1, 3)
+        residual = float(
+            np.mean(np.linalg.norm(corrected_lab - reference_lab, axis=1))
+        )
     return matrix, residual
+
+
+def _leave_one_out_residual_dE(
+    measured: np.ndarray, reference: np.ndarray, reference_lab: np.ndarray
+) -> float | None:
+    """
+    Mean held-out CIE76 error: predict each patch from a fit on the others.
+
+    Returns None when there are too few patches for each leave-one-out fit to be
+    determined (``n - 1`` must be at least the parameter count), because then the
+    held-out estimate is as meaningless as the training one.
+    """
+    n = len(measured)
+    if n - 1 < _CORRECTION_PARAMS:
+        return None
+
+    errors: list[float] = []
+    for i in range(n):
+        keep = np.ones(n, dtype=bool)
+        keep[i] = False
+        train = np.hstack([measured[keep], np.ones((n - 1, 1))])
+        model, *_ = np.linalg.lstsq(train, reference[keep], rcond=None)
+        point = np.hstack([measured[i : i + 1], np.ones((1, 1))])
+        predicted = np.clip(point @ model, 0, 1)
+        predicted_lab = color.rgb2lab(predicted.reshape(-1, 1, 3)).reshape(-1, 3)
+        errors.append(float(np.linalg.norm(predicted_lab[0] - reference_lab[i])))
+    return float(np.mean(errors))
 
 
 def apply_correction(rgb: np.ndarray, matrix: np.ndarray) -> np.ndarray:
@@ -718,6 +767,20 @@ class Calibrator:
                     "No colour card found in this image - values are "
                     "session-relative only. If your card has no printed frame, "
                     "mark its corners in the Plates tab."
+                )
+            elif min(len(measured), self.card.n_patches) < _MIN_CARD_PATCHES:
+                # Too few patches to even check the correction: with no more
+                # patches than the model has parameters, a bad read fits exactly
+                # and would pass the quality gate. Refuse the card correction and
+                # fall back to background normalisation rather than apply an
+                # unverifiable one.
+                n_usable = min(len(measured), self.card.n_patches)
+                result.warnings.append(
+                    f"Colour card has only {n_usable} usable patch(es); the "
+                    f"correction has {_CORRECTION_PARAMS} parameters per channel, "
+                    f"so at least {_MIN_CARD_PATCHES} are needed before its quality "
+                    "can be judged. Correction not applied - using background "
+                    "normalisation only."
                 )
             else:
                 matrix, residual = fit_colour_correction(measured, self.card)

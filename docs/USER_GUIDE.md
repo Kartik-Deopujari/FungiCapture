@@ -416,9 +416,13 @@ review and are worth knowing before you trust a number.
 - **Ring (boundary) texture features** currently include padding around the ring,
   so treat ring texture numbers as rough. Ring *colour* and *brightness* are not
   affected.
-- **A colour card needs enough patches.** With very few patches the card
-  correction can pass its quality check even on a bad read. Use a card with more
-  patches than a handful, and keep it free of glare.
+- **A colour card needs enough patches.** The correction has four parameters per
+  channel, so a card with only a handful of patches cannot be quality-checked —
+  a bad read would otherwise fit exactly and pass. The tool now refuses a card
+  with fewer than six usable patches (it falls back to background normalisation
+  and says so), and judges a larger card's read by a held-out error rather than a
+  self-fit. Use a card with plenty of patches (a 24-patch ColorChecker is ideal)
+  and keep it free of glare.
 
 ---
 
