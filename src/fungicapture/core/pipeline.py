@@ -939,9 +939,27 @@ def score_phenotypes(
     candidates = analysis_columns(list(frame.columns), project.params)
     progress(1, 3, "Running PCA")
 
-    phenotypes = compute_phenotypes(
-        frame, candidates, settings or PhenotypeSettings()
-    )
+    # compute_phenotypes raises if quality control leaves no usable feature -
+    # which happens for a small or very uniform batch (every feature is
+    # constant, so it is dropped). That must not abort the whole run: every
+    # other step records the problem and returns, so this one does too. The
+    # feature table has already been written, so nothing the user computed is
+    # lost - only the scoring could not be done.
+    try:
+        phenotypes = compute_phenotypes(
+            frame, candidates, settings or PhenotypeSettings()
+        )
+    except ValueError as error:
+        result.warnings.append(
+            f"Could not score phenotypes: {error} This usually means the "
+            "colonies were too few, or too alike, for the scoring to tell them "
+            "apart. The feature table was still written."
+        )
+        project.log_run(
+            "phenotypes", started, result.n_inputs, 0, 0,
+            notes="no usable features for scoring",
+        )
+        return result
     result.warnings.extend(phenotypes.warnings)
 
     progress(2, 3, "Writing results")

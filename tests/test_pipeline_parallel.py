@@ -123,3 +123,45 @@ def test_serial_and_parallel_agree(tmp_path, images):
     pd.testing.assert_frame_equal(f1n, f4n, check_exact=False, rtol=1e-9, atol=1e-9)
 
     assert res1["phenotypes"].n_outputs > 0 and res4["phenotypes"].n_outputs > 0
+
+
+def test_degenerate_batch_does_not_crash(tmp_path):
+    """A tiny, uniform batch must not abort the whole run.
+
+    When every colony is alike, phenotype quality control drops every feature
+    and compute_phenotypes raises. The run must catch that and finish with a
+    warning (and the feature table still written), not crash out of
+    run_pipeline the way it used to.
+    """
+    images = tmp_path / "images"
+    images.mkdir()
+    for i in range(4):
+        img = np.full((400, 600, 3), 200, np.uint8)
+        for (cx, cy) in COLONIES[:2]:  # reuse two colony centres, scaled to 600x400
+            cx = int(cx * 600 / IMG_W)
+            cy = int(cy * 400 / IMG_H)
+            cv2.circle(img, (cx, cy), 55, (80, 60, 40), -1)  # identical solid colonies
+        cv2.imwrite(str(images / f"S{i:02d}_SDA.png"),
+                    cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+    project = Project.create(
+        tmp_path / "proj", name="degen", mode=ImagingMode.DISH_BATCH,
+        image_dir=images, layout=PlateLayout(rows=1, cols=1), exist_ok=True,
+    )
+    project.media_label = "SDA"
+    project.save()
+    b = []
+    for (cx, cy) in COLONIES[:2]:
+        cx = cx * 600 / IMG_W
+        cy = cy * 400 / IMG_H
+        b.append([(cx - 70) / 600, (cy - 70) / 400, (cx + 70) / 600, (cy + 70) / 400])
+    boxes = BoxGeometry(rows=1, cols=1, boxes=b, freeform=True)
+
+    # The whole run must complete without raising.
+    results = pipeline.run_pipeline(project, backend="classical", boxes=boxes, workers=2)
+    steps = [r.step for r in results]
+    assert "phenotypes" in steps  # reached the last step rather than crashing
+    phenotypes = next(r for r in results if r.step == "phenotypes")
+    assert phenotypes.warnings  # it explained why it produced nothing
+    # The feature table is still on disk - the measured data is not lost.
+    assert (project.vectors_dir / "all_colony_features.csv").exists()
