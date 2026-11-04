@@ -320,10 +320,11 @@ class Sam3Segmenter:
         self.half = resolve_half_precision(params.half_precision, self.device)
         self._predictor = None
         self._checksum = ""
-
-    def _load(self):
-        if self._predictor is not None:
-            return self._predictor
+        # Check the package is importable NOW, at construction, not lazily on the
+        # first crop. Without this, make_segmenter("auto") reported "Using SAM 3"
+        # and then every crop failed identically when _load() first tried the
+        # import - a failure storm instead of one upfront message and a clean
+        # fall back to the classical segmenter.
         try:
             from ultralytics.models.sam import SAM3SemanticPredictor
         except ImportError as error:
@@ -337,8 +338,13 @@ class Sam3Segmenter:
                 "Note: ultralytics is AGPL-3.0, which is why FungiCapture is "
                 "AGPL-3.0. See docs/LICENSING.md."
             ) from error
+        self._predictor_cls = SAM3SemanticPredictor
 
-        self._predictor = SAM3SemanticPredictor(
+    def _load(self):
+        if self._predictor is not None:
+            return self._predictor
+
+        self._predictor = self._predictor_cls(
             overrides=dict(
                 conf=self.params.confidence,
                 task="segment",

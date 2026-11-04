@@ -159,11 +159,18 @@ def morphology_features(
 
     out["area_px"] = area
     out["perimeter_px"] = perimeter
+    # Circularity is 1.0 for a perfect circle and lower otherwise. The Crofton
+    # perimeter under-estimates for a very small object, which pushes the ratio
+    # above 1 (a single pixel gives ~1.75) - a nonsensical "more circular than a
+    # circle". Clamp so the documented 0-1 range holds; roughness is its
+    # reciprocal and clamps to >=1 to match.
     out["circularity"] = (
-        float(4.0 * math.pi * area / (perimeter**2)) if perimeter > 0 else math.nan
+        min(float(4.0 * math.pi * area / (perimeter**2)), 1.0)
+        if perimeter > 0 else math.nan
     )
     out["roughness"] = (
-        float(perimeter**2 / (4.0 * math.pi * area)) if area > 0 else math.nan
+        max(float(perimeter**2 / (4.0 * math.pi * area)), 1.0)
+        if area > 0 else math.nan
     )
     out["eccentricity"] = float(region.eccentricity)
     out["solidity"] = float(region.solidity)

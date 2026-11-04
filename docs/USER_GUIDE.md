@@ -396,11 +396,10 @@ output folders.
 These are known, honest caveats as of this version. They came out of an internal
 review and are worth knowing before you trust a number.
 
-- **Prefer 8-bit images for now.** Standard JPEG/PNG and camera RAW are 8-bit and
-  handled correctly. **16-bit** scanner/microscope TIFFs are currently scaled
-  inconsistently between the brightness and colour measurements, which can
-  distort the melanization score. If you only have 16-bit files, convert to 8-bit
-  before import until this is fixed.
+- **16-bit images are handled correctly.** Standard JPEG/PNG, camera RAW, and
+  16-bit scanner/microscope TIFFs are all scaled the same, absolute way now, so
+  the brightness and colour measurements agree and the melanization score is
+  consistent across image types.
 - **Small groups give exploratory scores.** If a growth medium has fewer
   colonies than measured features, the PCA axes are not uniquely determined and
   the "variance explained" is optimistic. The scoring now flags this: such a
@@ -413,9 +412,6 @@ review and are worth knowing before you trust a number.
   combined `phenotypes_all_media.*` file stacks scores from separate per-medium
   analyses whose axes do not mean the same thing, so it is only safe for a quick
   look, not as a single trait across media.
-- **Ring (boundary) texture features** currently include padding around the ring,
-  so treat ring texture numbers as rough. Ring *colour* and *brightness* are not
-  affected.
 - **A colour card needs enough patches.** The correction has four parameters per
   channel, so a card with only a handful of patches cannot be quality-checked —
   a bad read would otherwise fit exactly and pass. The tool now refuses a card

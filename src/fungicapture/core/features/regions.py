@@ -120,6 +120,12 @@ RAW_SUFFIXES = {
     ".raw", ".rwl", ".dcr", ".kdc", ".mrw", ".x3f",
 }
 
+# Refuse to decode an image larger than this many pixels. A real plate
+# photograph is at most ~60 MP; this leaves generous headroom while blocking a
+# decompression bomb or an accidental gigapixel/whole-slide image that would
+# otherwise exhaust memory on a small machine.
+_MAX_DECODE_PIXELS = 300_000_000
+
 
 def _read_raw(path: str) -> np.ndarray:
     """Decode a camera RAW file at full resolution with ``rawpy``.
@@ -213,6 +219,27 @@ def read_image(path) -> np.ndarray:
             # unusual container still opens *somehow* - but record why the
             # proper full-resolution path did not work.
             problems.append(f"rawpy: {error}")
+
+    # Guard against a decompression bomb or an accidental gigapixel image: peek
+    # the dimensions from the header (no full decode) and refuse something absurd
+    # with a clear message, rather than letting a decoder try to allocate it and
+    # exhaust memory on a small machine. Best effort - only for formats a light
+    # header read understands; a RAW is bounded by its sensor and handled above.
+    try:
+        from PIL import Image
+
+        with Image.open(path) as probe:
+            pixels = int(probe.size[0]) * int(probe.size[1])
+    except Exception:
+        pixels = None
+    if pixels is not None and pixels > _MAX_DECODE_PIXELS:
+        raise OSError(
+            f"This image is {pixels / 1e6:.0f} megapixels, above the "
+            f"{_MAX_DECODE_PIXELS / 1e6:.0f} MP safety limit. Decoding it could "
+            "exhaust memory. If it is a real plate photograph, downscale it "
+            "first; if it is a stitched or whole-slide image, it is not what "
+            "FungiCapture is meant to read."
+        )
 
     try:
         return io.imread(path)

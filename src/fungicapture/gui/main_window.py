@@ -449,14 +449,34 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._handle is not None and self._handle.is_running():
+            if getattr(self, "_pending_close", False):
+                # Close already requested; we are just waiting for the job to
+                # stop. Don't ask again - the auto-close below will fire.
+                event.ignore()
+                return
             if QMessageBox.question(
                 self, "A job is still running",
-                "Quit anyway? The current job will be stopped.",
+                "Quit anyway? The current job will be stopped at its next "
+                "checkpoint, which may take a moment.",
             ) != QMessageBox.Yes:
                 event.ignore()
                 return
             self._handle.cancel()
-            self._handle.wait(3000)
+            # Cancellation is cooperative and only takes effect between items, so
+            # a long single item (e.g. SAM 3 on CPU) may still be running after
+            # the wait. Accepting the close then would destroy a live QThread and
+            # crash on exit, so instead keep the window open and close it
+            # automatically once the job really finishes.
+            if not self._handle.wait(3000):
+                self._pending_close = True
+                self._handle.thread.finished.connect(self.close)
+                QMessageBox.information(
+                    self, "Finishing up",
+                    "The current step is still finishing and cannot be stopped "
+                    "mid-item. The window will close on its own when it is done.",
+                )
+                event.ignore()
+                return
         if self.project is not None:
             self.project.save()
         event.accept()

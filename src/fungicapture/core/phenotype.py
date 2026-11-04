@@ -53,9 +53,10 @@ class PhenotypeSettings:
     """Drop a feature present in fewer than this fraction of colonies."""
 
     min_cv: float = 0.01
-    """Drop a feature whose coefficient of variation is below this. A
-    near-constant column carries no information but can still create a
-    spurious PCA direction out of numerical noise."""
+    """Drop a feature whose spread, relative to its own peak magnitude, is below
+    this. A near-constant column carries no information but can still create a
+    spurious PCA direction out of numerical noise. Scaled by peak magnitude, not
+    the mean, so a signed feature centred near zero is judged fairly."""
 
     n_components: int = 20
     """Components to keep in the clean model. Only the first few are used as
@@ -152,11 +153,18 @@ def select_features(
             dropped[column] = "no values at all"
             continue
 
-        mean = float(values.mean())
+        # Near-constant test, scaled by the feature's own magnitude - but by its
+        # peak absolute value, NOT its mean. Dividing by the mean (a coefficient
+        # of variation) breaks for the many features here that are signed and
+        # centre near zero (Lab a*/b* means, slopes, skew): a genuinely varying
+        # a* channel with mean ~0 would get a huge or tiny CV and be dropped or
+        # kept for the wrong reason. Peak magnitude captures the spread without
+        # collapsing at mean zero, and a truly constant column still scores 0.
         deviation = float(values.std(ddof=0))
-        cv = deviation / abs(mean) if abs(mean) > 1e-8 else deviation
-        if cv < settings.min_cv:
-            dropped[column] = f"almost constant (CV {cv:.4f})"
+        scale = max(float(values.abs().max()), 1e-12)
+        relative = deviation / scale
+        if relative < settings.min_cv:
+            dropped[column] = f"almost constant (relative spread {relative:.4f})"
             continue
 
         kept.append(column)
@@ -403,6 +411,14 @@ def compute_phenotypes(
     combined = (
         pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
     )
+    if len(tables) > 1:
+        warnings.append(
+            "The combined-media table stacks PC scores from a SEPARATE PCA per "
+            "medium. PC1 on one medium and PC1 on another are different axes "
+            "(different meaning and sign), so the pooled PC1_score column is only "
+            "interpretable within a medium - use the per-medium files for a GWAS, "
+            "not the combined one."
+        )
     return PhenotypeResult(per_media, combined, settings, dropped, warnings)
 
 

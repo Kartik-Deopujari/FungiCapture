@@ -22,12 +22,16 @@ from .regions import bounding_patch
 
 
 def quantise_region(
-    gray: np.ndarray, region: np.ndarray, levels: int
+    gray: np.ndarray,
+    region: np.ndarray,
+    levels: int,
+    *,
+    sentinel: int | None = None,
 ) -> np.ndarray | None:
     """
     Crop to the region and reduce it to ``levels`` grey levels.
 
-    Two deliberate choices here, both of which matter scientifically:
+    Deliberate choices here, all of which matter scientifically:
 
     1. **Local rescaling.** The region is stretched to its own min and max
        before binning. A pale colony and a dark colony then both use the full
@@ -36,10 +40,16 @@ def quantise_region(
        Without this, a dark colony would compress into a few bins and its
        texture would look artificially uniform.
 
-    2. **Median fill outside the region.** Pixels outside the mask are set to
-       the region median, not to zero. Zero would put a hard black edge right
-       at the colony boundary, and GLCM would report that artificial cliff as
-       genuine high-contrast texture.
+    2. **Fill outside the region.** Pixels outside the mask need *some* value,
+       because a GLCM is computed on a rectangular patch. ``sentinel=None``
+       (the default) fills them with the region median - a natural-looking
+       patch, used by the QC panel for display. ``glcm_features`` instead passes
+       ``sentinel=levels``: an extra bin that it then drops from the
+       co-occurrence matrix, so the fill is *excluded* rather than counted. That
+       is what stops the thin boundary ring - whose bounding box is ~87% fill -
+       from having its texture swamped by the fill value. Zero fill is used in
+       neither case: a hard black edge at the boundary would read as real
+       high-contrast texture.
     """
     if region.sum() == 0:
         return None
@@ -54,7 +64,8 @@ def quantise_region(
         scaled = np.zeros_like(scaled)
 
     scaled = np.clip(np.floor(scaled * (levels - 1)), 0, levels - 1).astype(np.uint8)
-    patch = bounding_patch(scaled, region)
+    fill = float(sentinel) if sentinel is not None else None
+    patch = bounding_patch(scaled, region, fill=fill)
     return None if patch is None else patch.astype(np.uint8)
 
 
@@ -93,22 +104,42 @@ def glcm_features(
     if region.sum() < 8:
         return out
 
-    patch = quantise_region(gray, region, params.levels)
+    levels = params.levels
+    # Fill outside the region with a sentinel bin (one above the real levels),
+    # so we can exclude it from the matrix and measure texture on real pixels
+    # only - crucial for the ring, whose bounding box is mostly fill.
+    patch = quantise_region(gray, region, levels, sentinel=levels)
     if patch is None or patch.size == 0:
         return out
 
-    matrix = feature.graycomatrix(
+    counts = feature.graycomatrix(
         patch,
         distances=list(params.distances),
         angles=list(params.angles_rad),
-        levels=params.levels,
+        levels=levels + 1,       # +1 for the sentinel bin
         symmetric=True,
-        normed=True,
+        normed=False,            # raw counts, so we can drop the sentinel then renormalise
     )
+    # Drop every co-occurrence that involved an outside-region (sentinel) pixel,
+    # then renormalise each distance/angle slice over the real pixels alone.
+    counts = counts[:levels, :levels, :, :].astype(np.float64)
+    slice_sums = counts.sum(axis=(0, 1), keepdims=True)
+    valid = slice_sums[0, 0, :, :] > 0  # (distance, angle) slices with real pairs
+    if not valid.any():
+        return out  # the region has no adjacent real pixels to co-occur
+    matrix = np.divide(counts, slice_sums, out=np.zeros_like(counts), where=slice_sums > 0)
+
+    import warnings as _warnings
+
     for prop in params.properties:
-        values = feature.graycoprops(matrix, prop)
-        out[f"{prefix}_glcm_{prop}_mean"] = float(np.mean(values))
-        out[f"{prefix}_glcm_{prop}_std"] = float(np.std(values))
+        with _warnings.catch_warnings():
+            # A fully empty slice (excluded via ``valid``) can make correlation
+            # divide by zero; we ignore that noise and average only valid slices.
+            _warnings.simplefilter("ignore")
+            values = feature.graycoprops(matrix, prop)
+        usable = values[valid]
+        out[f"{prefix}_glcm_{prop}_mean"] = float(np.mean(usable))
+        out[f"{prefix}_glcm_{prop}_std"] = float(np.std(usable))
     return out
 
 

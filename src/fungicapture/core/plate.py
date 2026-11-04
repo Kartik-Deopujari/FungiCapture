@@ -465,11 +465,14 @@ def iter_box_crops(
 def freeform_well_id(index: int) -> str:
     """Name a hand-placed box by its position in the list: ``A01``, ``A02``, …
 
-    Numbers run 01 to 99, then the letter advances (``B01``), which keeps every
-    name inside the ``[A-H]\\d{2}`` shape the rest of the pipeline recognises
-    while still allowing far more colonies than a dish would ever hold.
+    Numbers run 01 to 99, then the letter advances (``B01``, … ``H99``, ``I01``).
+    The letter is NOT capped at H: capping it made index 693 and index 792 both
+    produce ``H01``, so two hand-placed colonies exported under the same name and
+    one silently overwrote the other. Letting the letter run on keeps every id
+    unique, which matters far more than staying inside A-H for the (vanishingly
+    rare) case of hundreds of boxes on one dish.
     """
-    letter = chr(ord("A") + min(index // 99, 7))
+    letter = chr(ord("A") + index // 99)
     return f"{letter}{index % 99 + 1:02d}"
 
 

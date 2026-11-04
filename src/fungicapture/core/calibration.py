@@ -319,8 +319,9 @@ def find_card_patches(
     """
     Locate the card and read its patch colours.
 
-    Returns an array of shape ``(n_patches, 3)`` in linear sRGB 0-1, or None if
-    the card could not be found.
+    Returns an array of shape ``(n_patches, 3)`` of the patch RGB values scaled
+    to 0-1 (gamma-encoded sRGB, as stored in the image - not linear light), or
+    None if the card could not be found.
 
     Detection strategy: the card is a rigid rectangular lattice of flat colour
     patches, which is visually unlike anything else on an agar plate. Candidate
