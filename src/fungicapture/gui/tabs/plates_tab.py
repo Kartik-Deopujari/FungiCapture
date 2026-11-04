@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -45,6 +45,43 @@ from ...core.platemap import PlateMap
 from ...core.project import Project
 from ..widgets.folder_row import FolderPanel, count_images
 from ..widgets.plate_canvas import PlateCanvas
+
+
+class _ImageLoadSignals(QObject):
+    """The signal a background image load emits when it finishes.
+
+    A ``QRunnable`` cannot carry signals itself, so it holds one of these. The
+    payload is ``(sequence, path, rgb_or_None, error_message)`` - the sequence
+    number lets the tab ignore a load whose image is no longer the one on
+    screen.
+    """
+
+    done = Signal(int, str, object, str)
+
+
+class _ImageLoadRunnable(QRunnable):
+    """
+    Decode one photograph off the UI thread.
+
+    Full-resolution decoding - especially a camera RAW, which ``rawpy`` has to
+    demosaic - takes seconds. Done on the UI thread (as it was before) it froze
+    the whole window the moment a folder was opened and again on every image
+    switch. Here it runs on a worker thread and the result is handed back by
+    signal, so the window stays responsive while the photo loads.
+    """
+
+    def __init__(self, sequence: int, path: Path):
+        super().__init__()
+        self.signals = _ImageLoadSignals()
+        self._sequence = sequence
+        self._path = path
+
+    def run(self) -> None:
+        try:
+            rgb = load_rgb(self._path)
+            self.signals.done.emit(self._sequence, str(self._path), rgb, "")
+        except Exception as error:  # noqa: BLE001 - reported to the UI thread
+            self.signals.done.emit(self._sequence, str(self._path), None, str(error))
 
 
 class PlateMapEditor(QDialog):
@@ -245,6 +282,18 @@ class PlatesTab(QWidget):
         # already opened is instant instead of re-decoding a 50-megapixel file.
         self._rgb_cache: OrderedDict[str, object] = OrderedDict()
         self._rgb_cache_max = 5
+        # Photographs are decoded on a background pool so a slow decode (a big
+        # RAW especially) never freezes the window. A small pool keeps fast
+        # scrolling from launching dozens of decodes at once; the sequence
+        # number means only the latest request's result is shown.
+        self._load_pool = QThreadPool(self)
+        self._load_pool.setMaxThreadCount(2)
+        self._load_seq = 0
+        # In-flight loads, kept alive until their result arrives. A QRunnable is
+        # auto-deleted the moment run() returns, which can destroy its signal
+        # object before the queued signal reaches the UI thread - dropping the
+        # image. Holding a reference here until the slot runs prevents that.
+        self._pending_loads: dict[int, _ImageLoadRunnable] = {}
 
         outer = QVBoxLayout(self)
 
@@ -475,34 +524,62 @@ class PlatesTab(QWidget):
         if self._images:
             self.image_list.setCurrentRow(0)
 
-    def _load_rgb_cached(self, path: Path):
-        """Decode a photograph, reusing a recent decode when possible."""
-        key = str(path)
-        cached = self._rgb_cache.get(key)
+    def _cache_get(self, path: Path):
+        """Return a recently decoded photograph, or None."""
+        cached = self._rgb_cache.get(str(path))
         if cached is not None:
-            self._rgb_cache.move_to_end(key)
-            return cached
-        rgb = load_rgb(path)
-        self._rgb_cache[key] = rgb
+            self._rgb_cache.move_to_end(str(path))
+        return cached
+
+    def _cache_put(self, path: Path, rgb) -> None:
+        """Store a decoded photograph, dropping the least-recently used."""
+        self._rgb_cache[str(path)] = rgb
         while len(self._rgb_cache) > self._rgb_cache_max:
             self._rgb_cache.popitem(last=False)
-        return rgb
 
     def _show_image(self, row: int) -> None:
         if not (0 <= row < len(self._images)):
             return
-        try:
-            rgb = self._load_rgb_cached(self._images[row])
-        except Exception as error:
-            QMessageBox.warning(self, "Could not open image", str(error))
+        path = self._images[row]
+
+        # Already decoded: show it at once, no background trip needed.
+        cached = self._cache_get(path)
+        if cached is not None:
+            self._display_image(path, cached)
             return
+
+        # Otherwise decode off the UI thread. Bump the sequence so that when
+        # several loads are in flight (fast scrolling), only the newest one is
+        # actually shown - the rest are quietly discarded when they return.
+        self._load_seq += 1
+        self.plate_status.setText(f"Loading {path.name}…")
+        runnable = _ImageLoadRunnable(self._load_seq, path)
+        runnable.setAutoDelete(False)  # we own its lifetime via _pending_loads
+        runnable.signals.done.connect(self._on_image_loaded)
+        self._pending_loads[self._load_seq] = runnable
+        self._load_pool.start(runnable)
+
+    def _on_image_loaded(self, sequence: int, path_str: str, rgb, error: str) -> None:
+        """Receive a decoded photograph from a worker thread (on the UI thread)."""
+        # Drop the reference first, so the runnable is freed however this returns.
+        self._pending_loads.pop(sequence, None)
+        if sequence != self._load_seq:
+            return  # a newer image was selected while this one was decoding
+        if rgb is None:
+            self.plate_status.setText(f"Could not open {Path(path_str).name}: {error}")
+            return
+        path = Path(path_str)
+        self._cache_put(path, rgb)
+        self._display_image(path, rgb)
+
+    def _display_image(self, path: Path, rgb) -> None:
         self.canvas.set_image(rgb)
         if self.boxes is not None:
             self.canvas.set_boxes(self.boxes)
         elif self.grid is not None:
             self.canvas.set_grid(self.grid)
         self.plate_status.setText(
-            f"{self._images[row].name}   {rgb.shape[1]} × {rgb.shape[0]} px"
+            f"{path.name}   {rgb.shape[1]} × {rgb.shape[0]} px"
         )
 
     # ---------------- layout ----------------
