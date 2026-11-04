@@ -11,9 +11,11 @@ silently kept.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -52,6 +54,17 @@ class ValidateTab(QWidget):
         self._features = None
         self._current = -1
         self._crops_root: Path | None = None
+        # Rendering a QC panel (a matplotlib figure) takes a moment, so clicking
+        # through many colonies was slow and every revisit re-rendered. Cache the
+        # finished panel image per colony, and debounce selection so fast
+        # scrolling through the list renders only the colony it lands on.
+        self._panel_cache: OrderedDict[str, QPixmap] = OrderedDict()
+        self._panel_cache_max = 32
+        self._pending_render: tuple[Path, Path, str] | None = None
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(120)
+        self._render_timer.timeout.connect(self._render_pending)
 
         outer = QVBoxLayout(self)
 
@@ -176,6 +189,9 @@ class ValidateTab(QWidget):
             return
         from ...core.pipeline import pair_crops_and_masks
 
+        # Feature numbers or folders may have changed, so stale rendered panels
+        # must not be reused.
+        self._panel_cache.clear()
         self._crops_root = self.folders["crops"].effective() or self.project.crops_dir
         self._pairs = pair_crops_and_masks(
             self.project,
@@ -246,21 +262,48 @@ class ValidateTab(QWidget):
         if mask_path is None:
             return
         self._current = row
-        self._render(crop_path, mask_path)
+        key = self._colony_key(crop_path)
 
-    def _render(self, crop_path: Path, mask_path: Path) -> None:
-        """Build the QC panel and show it.
+        # Show the verdict note straight away - it is cheap and should not wait
+        # on the panel render.
+        verdict = self.verdicts.get(key) if self.verdicts else None
+        self.note.setText(verdict.note if verdict else "")
+
+        cached = self._panel_cache.get(key)
+        if cached is not None:
+            self._panel_cache.move_to_end(key)
+            self._render_timer.stop()
+            self._pending_render = None
+            self.panel_label.setPixmap(cached)
+            return
+
+        # Not cached: render after a short delay, so holding the arrow key to
+        # scroll through the list does not render every colony it passes - only
+        # the one it settles on.
+        self._pending_render = (crop_path, mask_path, key)
+        self.panel_label.setText("Rendering…")
+        self._render_timer.start()
+
+    def _render_pending(self) -> None:
+        if self._pending_render is None:
+            return
+        crop_path, mask_path, key = self._pending_render
+        self._pending_render = None
+        self._render(crop_path, mask_path, key)
+
+    def _render(self, crop_path: Path, mask_path: Path, key: str) -> None:
+        """Build the QC panel, cache it, and show it.
 
         Rendered to a temporary PNG rather than embedded live: matplotlib's Qt
         backend and PySide6 can disagree about which event loop owns the
-        figure, and a static image cannot crash the window.
+        figure, and a static image cannot crash the window. The finished pixmap
+        is cached per colony so returning to one is instant.
         """
         import tempfile
 
         from ...core.validate import build_panel_data, make_panel, save_panel
 
         assert self.project is not None
-        key = self._colony_key(crop_path)
 
         values: dict = {}
         if self._features is not None and "base_key" in self._features.columns:
@@ -282,11 +325,11 @@ class ValidateTab(QWidget):
             self.panel_label.setText(f"Could not build the panel:\n{error}")
             return
 
-        from PySide6.QtGui import QPixmap
-
-        self.panel_label.setPixmap(QPixmap(str(temporary)))
-        verdict = self.verdicts.get(key) if self.verdicts else None
-        self.note.setText(verdict.note if verdict else "")
+        pixmap = QPixmap(str(temporary))
+        self._panel_cache[key] = pixmap
+        while len(self._panel_cache) > self._panel_cache_max:
+            self._panel_cache.popitem(last=False)
+        self.panel_label.setPixmap(pixmap)
 
     def _step(self, direction: int) -> None:
         row = self.colony_list.currentRow() + direction
@@ -304,8 +347,6 @@ class ValidateTab(QWidget):
 
         colour = STATUS_COLOURS.get(status, "#888888")
         item.setToolTip(f"status: {status}")
-        from PySide6.QtGui import QColor
-
         item.setForeground(QColor(colour))
 
         counts = self.verdicts.status_counts()

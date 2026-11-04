@@ -126,6 +126,15 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+        settings_menu = self.menuBar().addMenu("&Settings")
+        calibration_action = QAction("Colour calibration…", self)
+        calibration_action.setToolTip(
+            "Turn colour-card correction on or off and choose the card "
+            "definition - the same options offered when a project is created."
+        )
+        calibration_action.triggered.connect(self._colour_calibration)
+        settings_menu.addAction(calibration_action)
+
         help_menu = self.menuBar().addMenu("&Help")
         about = QAction("About FungiCapture", self)
         about.triggered.connect(self._about)
@@ -155,6 +164,48 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().addPermanentWidget(self.cancel_button)
         self.statusBar().showMessage("Ready")
+
+    def _colour_calibration(self) -> None:
+        """Open the colour-card dialog on an existing project.
+
+        The same dialog is shown once when a project is created; this makes it
+        reachable afterwards too, so a colour reference card can be turned on,
+        changed or pointed at a different definition without starting over.
+        """
+        if self.project is None:
+            QMessageBox.information(
+                self, "No project",
+                "Open or create a project first, then set its colour calibration.",
+            )
+            return
+
+        from dataclasses import replace
+
+        from PySide6.QtWidgets import QDialog
+
+        from .home import ColourCalibrationDialog
+
+        dialog = ColourCalibrationDialog(self)
+        cal = self.project.params.calibration
+        dialog.use_card.setChecked(bool(getattr(cal, "use_colour_card", False)))
+        if getattr(cal, "card_definition_path", None):
+            dialog.card_path.setText(str(cal.card_definition_path))
+        region = getattr(cal, "card_search_region", "auto") or "auto"
+        index = dialog.region.findText(region)
+        if index >= 0:
+            dialog.region.setCurrentIndex(index)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.project.params = self.project.params.with_changes(
+            calibration=replace(cal, **dialog.settings())
+        )
+        self.project.save()
+        self._set_status(
+            "Colour calibration updated - it takes effect the next time you run "
+            "the feature step."
+        )
 
     def _show_notes(self) -> None:
         if not self._last_warnings:
